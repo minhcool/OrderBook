@@ -30,6 +30,9 @@ Stop it with `Ctrl+C`.
 - One symbol maps to one orderbook.
 - Request bodies are flat JSON objects.
 - The parser is intentionally tiny and only supports the fields shown here.
+- POST order endpoints require `Authorization: Bearer <Clerk session token>`.
+- Missing or malformed bearer tokens return `401`.
+- The current C++ server derives `TraderId` from the Clerk JWT `sub` claim, but does not yet verify the JWT signature against Clerk JWKS. Add real JWT verification before making trading public.
 
 ## GET Endpoints
 
@@ -92,7 +95,6 @@ Body:
 ```json
 {
   "symbol": "BTC-USD",
-  "traderId": 1,
   "orderId": 101,
   "price": 100,
   "quantity": 5
@@ -111,7 +113,6 @@ Body:
 ```json
 {
   "symbol": "BTC-USD",
-  "traderId": 1,
   "orderId": 102,
   "quantity": 5
 }
@@ -129,7 +130,6 @@ Body:
 ```json
 {
   "symbol": "BTC-USD",
-  "traderId": 1,
   "orderId": 103,
   "price": 100,
   "quantity": 5
@@ -148,7 +148,6 @@ Body:
 ```json
 {
   "symbol": "BTC-USD",
-  "traderId": 1,
   "orderId": 104,
   "price": 100,
   "quantity": 5
@@ -167,7 +166,6 @@ Body:
 ```json
 {
   "symbol": "BTC-USD",
-  "traderId": 1,
   "orderId": 101,
   "price": 101,
   "quantity": 10
@@ -224,18 +222,26 @@ Cancel returns:
 
 ## PowerShell Examples
 
-PowerShell can mangle JSON quoting for `curl.exe`. Use `--%` in these examples.
+Set a token first:
+
+```powershell
+$env:CLERK_TOKEN = "paste_a_clerk_session_jwt_here"
+```
 
 Place a sell:
 
 ```powershell
-curl.exe --% -s -X POST http://localhost:8080/orders/sell -H "Content-Type: application/json" -d "{\"symbol\":\"BTC-USD\",\"traderId\":1,\"orderId\":101,\"price\":100,\"quantity\":5}"
+$headers = @{ Authorization = "Bearer $env:CLERK_TOKEN" }
+$body = @{ symbol = "BTC-USD"; orderId = 101; price = 100; quantity = 5 } | ConvertTo-Json
+Invoke-RestMethod -Method Post -Uri http://localhost:8080/orders/sell -Headers $headers -ContentType "application/json" -Body $body
 ```
 
 Place a crossing buy:
 
 ```powershell
-curl.exe --% -s -X POST http://localhost:8080/orders/buy -H "Content-Type: application/json" -d "{\"symbol\":\"BTC-USD\",\"traderId\":2,\"orderId\":201,\"price\":100,\"quantity\":3}"
+$headers = @{ Authorization = "Bearer $env:CLERK_TOKEN" }
+$body = @{ symbol = "BTC-USD"; orderId = 201; price = 100; quantity = 3 } | ConvertTo-Json
+Invoke-RestMethod -Method Post -Uri http://localhost:8080/orders/buy -Headers $headers -ContentType "application/json" -Body $body
 ```
 
 Read the book:
@@ -247,5 +253,7 @@ curl.exe -s http://localhost:8080/book/BTC-USD
 Cancel:
 
 ```powershell
-curl.exe --% -s -X POST http://localhost:8080/orders/cancel -H "Content-Type: application/json" -d "{\"symbol\":\"BTC-USD\",\"orderId\":101}"
+$headers = @{ Authorization = "Bearer $env:CLERK_TOKEN" }
+$body = @{ symbol = "BTC-USD"; orderId = 101 } | ConvertTo-Json
+Invoke-RestMethod -Method Post -Uri http://localhost:8080/orders/cancel -Headers $headers -ContentType "application/json" -Body $body
 ```

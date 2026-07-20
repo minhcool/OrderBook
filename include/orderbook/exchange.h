@@ -22,6 +22,7 @@ public:
     SubmitResult replaceSell(const std::string& symbol, TraderId traderId, OrderId orderId, Price price, Qty quantity);
 
     bool cancel(const std::string& symbol, OrderId orderId);
+    bool cancelForTrader(const std::string& symbol, TraderId traderId, OrderId orderId);
     BookSnapshot snapshot(const std::string& symbol, std::size_t depth = 10) const;
     std::vector<std::string> symbols() const;
 

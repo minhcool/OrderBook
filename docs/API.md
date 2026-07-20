@@ -190,6 +190,8 @@ The project now includes a small local HTTP server for testing GET/POST calls ar
 
 See [HTTP_API.md](HTTP_API.md).
 
+The HTTP API does not accept `traderId` from the browser. It derives the trader from the authenticated Clerk bearer token.
+
 ## CLI/HTTP Command Mapping
 
 A CLI or network API can map each command to one method:

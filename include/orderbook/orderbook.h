@@ -66,6 +66,7 @@ public:
     SubmitResult replaceSell(TraderId traderId, OrderId orderId, Price price, Qty quantity);
 
     bool cancel(OrderId id);
+    bool cancelForTrader(TraderId traderId, OrderId id);
     bool delBuy(const order& target);
     bool delSell(const order& target);
     bool changeOrder(const order& target, Qty newQuant, Price newPrice, Side side);
@@ -98,6 +99,7 @@ private:
     SubmitResult replaceLocked(order replacement, Type type);
     bool validateIncoming(const order& incoming, Type type, SubmitResult& result) const;
     bool hasRestingOrder(OrderId id) const;
+    bool hasRestingOrderForTrader(OrderId id, TraderId traderId) const;
     bool hasEnoughLiquidity(const order& incoming, Price limitPrice) const;
     Qty totalBuyQuantityLocked() const;
     Qty totalSellQuantityLocked() const;
@@ -105,4 +107,5 @@ private:
     void match(order& incoming, Price limitPrice, SubmitResult& result);
     void rest(order incoming);
     bool removeById(OrderId id);
+    bool removeByIdForTrader(OrderId id, TraderId traderId);
 };

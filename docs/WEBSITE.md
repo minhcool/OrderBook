@@ -2,6 +2,8 @@
 
 The website is a Vite/React app in `web/`. It is a browser UI for the local HTTP API server.
 
+Authentication is handled by Clerk. Signed-in users can submit, replace, and cancel orders. The website sends a Clerk bearer token to the C++ API server.
+
 ## Local Run
 
 Terminal 1:
@@ -16,6 +18,7 @@ Terminal 2:
 ```powershell
 cd C:\Users\nqmin\Documents\Projects\Orderbook\web
 npm install
+Copy-Item .env.example .env
 npm run dev
 ```
 
@@ -43,6 +46,7 @@ On Vercel:
 2. Use the repository root as the project root.
 3. Keep the build settings from `vercel.json`.
 4. Set `VITE_ORDERBOOK_API_URL` to the public URL of the orderbook API server.
+5. Set `VITE_CLERK_PUBLISHABLE_KEY` to your Clerk publishable key.
 
 Important: Vercel should host the frontend first. The current C++ API server is stateful and should run separately on a server/VPS/container that can keep one process alive.
 
@@ -52,12 +56,24 @@ For local development:
 
 ```text
 VITE_ORDERBOOK_API_URL=http://localhost:8080
+VITE_CLERK_PUBLISHABLE_KEY=pk_test_...
 ```
 
 For deployment:
 
 ```text
 VITE_ORDERBOOK_API_URL=https://your-api-server.example.com
+VITE_CLERK_PUBLISHABLE_KEY=pk_live_...
 ```
 
 The C++ API server now includes basic CORS headers for browser requests.
+
+## Clerk Setup
+
+1. Create a Clerk application.
+2. Enable the OAuth providers you want, such as Google or GitHub.
+3. Copy the publishable key.
+4. Add it locally to `web/.env`.
+5. Add it in Vercel as `VITE_CLERK_PUBLISHABLE_KEY`.
+
+The current backend reads the Clerk token subject and maps it to an internal `TraderId`. It still needs real Clerk JWT verification before production use.

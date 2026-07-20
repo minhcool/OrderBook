@@ -22,6 +22,13 @@ async function requestJson<T>(url: string, init?: RequestInit): Promise<T> {
   return data as T;
 }
 
+function authHeaders(token: string): HeadersInit {
+  return {
+    "Content-Type": "application/json",
+    Authorization: `Bearer ${token}`
+  };
+}
+
 export async function health(apiBase: string): Promise<{ ok: boolean }> {
   return requestJson(`${apiBase}/health`);
 }
@@ -45,39 +52,40 @@ function endpointFor(side: Side, mode: OrderMode): string {
 
 export async function submitOrder(
   apiBase: string,
+  token: string,
   side: Side,
   mode: OrderMode,
   order: OrderRequest
 ): Promise<SubmitResult> {
   return requestJson(`${apiBase}${endpointFor(side, mode)}`, {
     method: "POST",
-    headers: {
-      "Content-Type": "application/json"
-    },
+    headers: authHeaders(token),
     body: JSON.stringify(order)
   });
 }
 
 export async function replaceOrder(
   apiBase: string,
+  token: string,
   side: Side,
   order: Required<OrderRequest>
 ): Promise<SubmitResult> {
   return requestJson(`${apiBase}/orders/replace-${side}`, {
     method: "POST",
-    headers: {
-      "Content-Type": "application/json"
-    },
+    headers: authHeaders(token),
     body: JSON.stringify(order)
   });
 }
 
-export async function cancelOrder(apiBase: string, symbol: string, orderId: number): Promise<{ canceled: boolean }> {
+export async function cancelOrder(
+  apiBase: string,
+  token: string,
+  symbol: string,
+  orderId: number
+): Promise<{ canceled: boolean }> {
   return requestJson(`${apiBase}/orders/cancel`, {
     method: "POST",
-    headers: {
-      "Content-Type": "application/json"
-    },
+    headers: authHeaders(token),
     body: JSON.stringify({ symbol, orderId })
   });
 }

@@ -220,6 +220,23 @@ void test_duplicate_ids_require_explicit_replace() {
     assert(book.empty());
 }
 
+void test_replace_and_cancel_require_owner() {
+    orderbook book;
+
+    assert(book.buy(10, 1, 100, 5).accepted);
+
+    SubmitResult wrongTraderReplace = book.replaceBuy(20, 1, 101, 5);
+    assert(!wrongTraderReplace.accepted);
+    assert(book.totalQuantityAtPrice(Side::Buy, 100) == 5);
+    assert(book.totalQuantityAtPrice(Side::Buy, 101) == 0);
+
+    assert(!book.cancelForTrader(20, 1));
+    assert(book.totalQuantityAtPrice(Side::Buy, 100) == 5);
+
+    assert(book.cancelForTrader(10, 1));
+    assert(book.empty());
+}
+
 void test_named_order_entry_api_methods() {
     orderbook book;
 
@@ -432,6 +449,7 @@ int main() {
     test_ioc_orders();
     test_fok_orders();
     test_duplicate_ids_require_explicit_replace();
+    test_replace_and_cancel_require_owner();
     test_named_order_entry_api_methods();
     test_book_snapshot();
     test_exchange_routes_by_symbol();

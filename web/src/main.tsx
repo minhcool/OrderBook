@@ -1,5 +1,6 @@
 import React from "react";
 import ReactDOM from "react-dom/client";
+import { ClerkProvider, SignInButton, SignedIn, SignedOut, UserButton, useAuth, useUser } from "@clerk/clerk-react";
 import { Activity, CircleOff, Eraser, PlugZap, RefreshCw, Replace, Send, Server, Wifi, WifiOff } from "lucide-react";
 
 import { cancelOrder, fetchBook, fetchSymbols, health, replaceOrder, submitOrder } from "./api";
@@ -7,6 +8,7 @@ import type { BookSnapshot, OrderMode, Side, SubmitResult } from "./types";
 import "./styles.css";
 
 const DEFAULT_API_BASE = import.meta.env.VITE_ORDERBOOK_API_URL ?? "http://localhost:8080";
+const CLERK_PUBLISHABLE_KEY = import.meta.env.VITE_CLERK_PUBLISHABLE_KEY;
 const DEFAULT_SYMBOL = "BTC-USD";
 
 interface ActivityItem {
@@ -30,6 +32,9 @@ function resultSummary(result: SubmitResult): string {
 }
 
 function App() {
+  const { getToken, isLoaded, isSignedIn } = useAuth();
+  const { user } = useUser();
+
   const [apiBase, setApiBase] = React.useState(() => localStorage.getItem("orderbook.apiBase") ?? DEFAULT_API_BASE);
   const [symbol, setSymbol] = React.useState(DEFAULT_SYMBOL);
   const [symbols, setSymbols] = React.useState<string[]>([]);
@@ -40,13 +45,11 @@ function App() {
 
   const [side, setSide] = React.useState<Side>("buy");
   const [mode, setMode] = React.useState<OrderMode>("limit");
-  const [traderId, setTraderId] = React.useState("1");
   const [orderId, setOrderId] = React.useState("1001");
   const [price, setPrice] = React.useState("100");
   const [quantity, setQuantity] = React.useState("5");
 
   const [replaceSide, setReplaceSide] = React.useState<Side>("buy");
-  const [replaceTraderId, setReplaceTraderId] = React.useState("1");
   const [replaceOrderId, setReplaceOrderId] = React.useState("1001");
   const [replacePriceValue, setReplacePriceValue] = React.useState("101");
   const [replaceQuantity, setReplaceQuantity] = React.useState("5");
@@ -55,6 +58,19 @@ function App() {
   const pushActivity = React.useCallback((title: string, detail: string, ok: boolean) => {
     setActivity((items) => [{ id: Date.now() + Math.random(), title, detail, ok }, ...items].slice(0, 8));
   }, []);
+
+  const requireToken = React.useCallback(async () => {
+    if (!isLoaded || !isSignedIn) {
+      throw new Error("Sign in before sending orders");
+    }
+
+    const token = await getToken();
+    if (!token) {
+      throw new Error("Could not read Clerk session token");
+    }
+
+    return token;
+  }, [getToken, isLoaded, isSignedIn]);
 
   const refresh = React.useCallback(async () => {
     setLoading(true);
@@ -87,14 +103,14 @@ function App() {
 
     const payload = {
       symbol,
-      traderId: toNumber(traderId),
       orderId: toNumber(orderId),
       quantity: toNumber(quantity),
       ...(mode === "market" ? {} : { price: toNumber(price) })
     };
 
     try {
-      const result = await submitOrder(apiBase, side, mode, payload);
+      const token = await requireToken();
+      const result = await submitOrder(apiBase, token, side, mode, payload);
       pushActivity(`${mode.toUpperCase()} ${side.toUpperCase()} #${payload.orderId}`, resultSummary(result), result.accepted);
       setOrderId(String(toNumber(orderId) + 1));
       await refresh();
@@ -108,14 +124,14 @@ function App() {
 
     const payload = {
       symbol,
-      traderId: toNumber(replaceTraderId),
       orderId: toNumber(replaceOrderId),
       price: toNumber(replacePriceValue),
       quantity: toNumber(replaceQuantity)
     };
 
     try {
-      const result = await replaceOrder(apiBase, replaceSide, payload);
+      const token = await requireToken();
+      const result = await replaceOrder(apiBase, token, replaceSide, payload);
       pushActivity(`REPLACE ${replaceSide.toUpperCase()} #${payload.orderId}`, resultSummary(result), result.accepted);
       await refresh();
     } catch (error) {
@@ -127,7 +143,8 @@ function App() {
     event.preventDefault();
 
     try {
-      const result = await cancelOrder(apiBase, symbol, toNumber(cancelId));
+      const token = await requireToken();
+      const result = await cancelOrder(apiBase, token, symbol, toNumber(cancelId));
       pushActivity(`CANCEL #${cancelId}`, result.canceled ? "canceled" : "order not found", result.canceled);
       await refresh();
     } catch (error) {
@@ -136,6 +153,7 @@ function App() {
   }
 
   const spread = book.bids.length > 0 && book.asks.length > 0 ? book.asks[0].price - book.bids[0].price : null;
+  const signedInName = user?.primaryEmailAddress?.emailAddress ?? user?.fullName ?? user?.id ?? "Signed in";
 
   return (
     <main className="shell">
@@ -145,6 +163,15 @@ function App() {
           <p>{symbol}</p>
         </div>
         <div className="status-row">
+          <SignedIn>
+            <span className="user-pill">{signedInName}</span>
+            <UserButton afterSignOutUrl="/" />
+          </SignedIn>
+          <SignedOut>
+            <SignInButton mode="modal">
+              <button type="button">Sign in</button>
+            </SignInButton>
+          </SignedOut>
           <span className={`status ${apiOnline ? "online" : "offline"}`}>
             {apiOnline ? <Wifi size={16} /> : <WifiOff size={16} />}
             {apiOnline ? "API online" : "API offline"}
@@ -203,6 +230,12 @@ function App() {
           </div>
 
           <form className="form-grid" onSubmit={handleSubmitOrder}>
+            <SignedOut>
+              <div className="auth-callout">
+                <strong>Sign in required</strong>
+                <span>Orders are tied to your Clerk user. Trader ID is assigned by the API.</span>
+              </div>
+            </SignedOut>
             <Segmented<Side> value={side} onChange={setSide} options={[
               { label: "Buy", value: "buy" },
               { label: "Sell", value: "sell" }
@@ -213,10 +246,6 @@ function App() {
               { label: "IOC", value: "ioc" },
               { label: "FOK", value: "fok" }
             ]} />
-            <label>
-              Trader ID
-              <input inputMode="numeric" value={traderId} onChange={(event) => setTraderId(event.target.value)} />
-            </label>
             <label>
               Order ID
               <input inputMode="numeric" value={orderId} onChange={(event) => setOrderId(event.target.value)} />
@@ -229,7 +258,7 @@ function App() {
               Quantity
               <input inputMode="numeric" value={quantity} onChange={(event) => setQuantity(event.target.value)} />
             </label>
-            <button className={`primary ${side}`} type="submit">
+            <button className={`primary ${side}`} type="submit" disabled={!isSignedIn}>
               <Send size={17} />
               Submit
             </button>
@@ -243,14 +272,16 @@ function App() {
           </div>
 
           <form className="form-grid compact" onSubmit={handleReplace}>
+            <SignedOut>
+              <div className="auth-callout">
+                <strong>Sign in required</strong>
+                <span>Only authenticated users can replace or cancel orders.</span>
+              </div>
+            </SignedOut>
             <Segmented<Side> value={replaceSide} onChange={setReplaceSide} options={[
               { label: "Buy", value: "buy" },
               { label: "Sell", value: "sell" }
             ]} />
-            <label>
-              Trader ID
-              <input inputMode="numeric" value={replaceTraderId} onChange={(event) => setReplaceTraderId(event.target.value)} />
-            </label>
             <label>
               Order ID
               <input inputMode="numeric" value={replaceOrderId} onChange={(event) => setReplaceOrderId(event.target.value)} />
@@ -263,7 +294,7 @@ function App() {
               Quantity
               <input inputMode="numeric" value={replaceQuantity} onChange={(event) => setReplaceQuantity(event.target.value)} />
             </label>
-            <button type="submit">
+            <button type="submit" disabled={!isSignedIn}>
               <Replace size={17} />
               Replace
             </button>
@@ -274,7 +305,7 @@ function App() {
               Cancel ID
               <input inputMode="numeric" value={cancelId} onChange={(event) => setCancelId(event.target.value)} />
             </label>
-            <button type="submit" className="danger">
+            <button type="submit" className="danger" disabled={!isSignedIn}>
               <CircleOff size={17} />
               Cancel
             </button>
@@ -367,6 +398,23 @@ function Segmented<T extends string>({
 
 ReactDOM.createRoot(document.getElementById("root")!).render(
   <React.StrictMode>
-    <App />
+    {CLERK_PUBLISHABLE_KEY ? (
+      <ClerkProvider publishableKey={CLERK_PUBLISHABLE_KEY}>
+        <App />
+      </ClerkProvider>
+    ) : (
+      <MissingClerkConfig />
+    )}
   </React.StrictMode>
 );
+
+function MissingClerkConfig() {
+  return (
+    <main className="shell">
+      <section className="panel missing-config">
+        <h1>Clerk is not configured</h1>
+        <p>Set <code>VITE_CLERK_PUBLISHABLE_KEY</code> in <code>web/.env</code> locally and in Vercel environment variables.</p>
+      </section>
+    </main>
+  );
+}

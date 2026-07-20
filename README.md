@@ -11,11 +11,12 @@ The project currently provides an in-memory orderbook library with:
 - explicit order replace/update
 - cancel by order ID
 - trader IDs and self-trade prevention
+- Clerk login support in the website
 - coarse-grained mutex protection
 - correctness tests
 - performance benchmarks
 
-It is not connected to a real exchange, frontend, database, or network API yet. All current data is created by C++ code in the tests, demo, or benchmark.
+It is not connected to a real exchange or database yet. The current API and website are development prototypes; all orderbook state is in memory and disappears when the API process restarts.
 
 ## Layout
 
@@ -71,6 +72,7 @@ Run the website:
 ```powershell
 cd web
 npm install
+Copy-Item .env.example .env
 npm run dev
 ```
 
@@ -119,7 +121,8 @@ For the Vercel-ready website, see [docs/WEBSITE.md](docs/WEBSITE.md).
 - No CLI yet.
 - Local HTTP API exists for testing, but it is not production-grade.
 - No WebSocket/FIX API yet.
-- Website exists, but authentication is not implemented yet.
+- Website uses Clerk login, but account storage/roles are not implemented yet.
+- Backend JWT signature verification is not implemented yet; the current API auth bridge is for development.
 - No accounts, balances, margin, or settlement.
 - No persistence or event log.
 - No tick size or lot size validation.

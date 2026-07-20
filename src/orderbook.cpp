@@ -70,6 +70,11 @@ bool orderbook::cancel(OrderId id) {
     return removeById(id);
 }
 
+bool orderbook::cancelForTrader(TraderId traderId, OrderId id) {
+    std::lock_guard<std::mutex> lock(bookMutex);
+    return removeByIdForTrader(id, traderId);
+}
+
 bool orderbook::delBuy(const order& target) {
     if (target.getSide() != Side::Buy) {
         return false;
@@ -249,12 +254,12 @@ SubmitResult orderbook::replaceLocked(order replacement, Type type) {
         return result;
     }
 
-    if (!hasRestingOrder(replacement.getId())) {
-        result.message = "order id is not resting on the book";
+    if (!hasRestingOrderForTrader(replacement.getId(), replacement.getTraderId())) {
+        result.message = "order id is not resting for this trader";
         return result;
     }
 
-    removeById(replacement.getId());
+    removeByIdForTrader(replacement.getId(), replacement.getTraderId());
 
     const Price limitPrice = effectiveLimitPrice(replacement, type);
 
@@ -324,6 +329,25 @@ bool orderbook::hasRestingOrder(OrderId id) const {
     };
 
     return hasId(buys) || hasId(sells);
+}
+
+bool orderbook::hasRestingOrderForTrader(OrderId id, TraderId traderId) const {
+    const auto hasIdForTrader = [id, traderId](const auto& book) {
+        for (const auto& [price, queue] : book) {
+            (void)price;
+            const auto found = std::find_if(queue.begin(), queue.end(), [id, traderId](const order& resting) {
+                return resting.getId() == id && resting.getTraderId() == traderId;
+            });
+
+            if (found != queue.end()) {
+                return true;
+            }
+        }
+
+        return false;
+    };
+
+    return hasIdForTrader(buys) || hasIdForTrader(sells);
 }
 
 bool orderbook::hasEnoughLiquidity(const order& incoming, Price limitPrice) const {
@@ -538,6 +562,40 @@ bool orderbook::removeById(OrderId id) {
         auto& queue = level->second;
         const auto found = std::find_if(queue.begin(), queue.end(), [id](const order& resting) {
             return resting.getId() == id;
+        });
+
+        if (found != queue.end()) {
+            queue.erase(found);
+            if (queue.empty()) {
+                sells.erase(level);
+            }
+            return true;
+        }
+    }
+
+    return false;
+}
+
+bool orderbook::removeByIdForTrader(OrderId id, TraderId traderId) {
+    for (auto level = buys.begin(); level != buys.end(); ++level) {
+        auto& queue = level->second;
+        const auto found = std::find_if(queue.begin(), queue.end(), [id, traderId](const order& resting) {
+            return resting.getId() == id && resting.getTraderId() == traderId;
+        });
+
+        if (found != queue.end()) {
+            queue.erase(found);
+            if (queue.empty()) {
+                buys.erase(level);
+            }
+            return true;
+        }
+    }
+
+    for (auto level = sells.begin(); level != sells.end(); ++level) {
+        auto& queue = level->second;
+        const auto found = std::find_if(queue.begin(), queue.end(), [id, traderId](const order& resting) {
+            return resting.getId() == id && resting.getTraderId() == traderId;
         });
 
         if (found != queue.end()) {

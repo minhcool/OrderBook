@@ -35,7 +35,6 @@ export interface BookSnapshot {
 
 export interface OrderRequest {
   symbol: string;
-  traderId: number;
   orderId: number;
   price?: number;
   quantity: number;

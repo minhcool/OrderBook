@@ -59,6 +59,22 @@ bool Exchange::cancel(const std::string& symbol, OrderId orderId) {
     return book->cancel(orderId);
 }
 
+bool Exchange::cancelForTrader(const std::string& symbol, TraderId traderId, OrderId orderId) {
+    orderbook* book = nullptr;
+
+    {
+        std::lock_guard<std::mutex> lock(exchangeMutex);
+        const auto found = books.find(symbol);
+        if (found == books.end()) {
+            return false;
+        }
+
+        book = found->second.get();
+    }
+
+    return book->cancelForTrader(traderId, orderId);
+}
+
 BookSnapshot Exchange::snapshot(const std::string& symbol, std::size_t depth) const {
     const orderbook* book = findBook(symbol);
     if (book == nullptr) {
