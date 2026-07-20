@@ -1,0 +1,440 @@
+:root {
+  color: #162033;
+  background: #f4f6f8;
+  font-family:
+    Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  min-width: 320px;
+  min-height: 100vh;
+}
+
+button,
+input {
+  font: inherit;
+}
+
+button {
+  align-items: center;
+  border: 1px solid #c8d0dc;
+  border-radius: 7px;
+  background: #ffffff;
+  color: #172033;
+  cursor: pointer;
+  display: inline-flex;
+  font-weight: 650;
+  gap: 8px;
+  justify-content: center;
+  min-height: 38px;
+  padding: 8px 12px;
+}
+
+button:hover {
+  border-color: #7e8da3;
+}
+
+button:disabled,
+input:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
+input {
+  border: 1px solid #c8d0dc;
+  border-radius: 7px;
+  color: #172033;
+  min-height: 38px;
+  outline: none;
+  padding: 8px 10px;
+  width: 100%;
+}
+
+input:focus {
+  border-color: #2f6fed;
+  box-shadow: 0 0 0 3px rgba(47, 111, 237, 0.12);
+}
+
+.shell {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  margin: 0 auto;
+  max-width: 1400px;
+  padding: 18px;
+}
+
+.topbar,
+.connection-band,
+.market-strip,
+.panel {
+  background: #ffffff;
+  border: 1px solid #dce2ea;
+  border-radius: 8px;
+}
+
+.topbar {
+  align-items: center;
+  display: flex;
+  justify-content: space-between;
+  padding: 16px 18px;
+}
+
+.topbar h1 {
+  font-size: 24px;
+  letter-spacing: 0;
+  line-height: 1.15;
+  margin: 0;
+}
+
+.topbar p {
+  color: #66758b;
+  margin: 4px 0 0;
+}
+
+.status-row {
+  align-items: center;
+  display: flex;
+  gap: 10px;
+}
+
+.status {
+  align-items: center;
+  border-radius: 999px;
+  display: inline-flex;
+  font-size: 14px;
+  font-weight: 700;
+  gap: 8px;
+  padding: 8px 10px;
+}
+
+.status.online {
+  background: #e9f8ef;
+  color: #16744b;
+}
+
+.status.offline {
+  background: #fff0ee;
+  color: #a33b2f;
+}
+
+.icon-button {
+  min-width: 38px;
+  padding: 8px;
+}
+
+.icon-button.ghost {
+  margin-left: auto;
+}
+
+.spin {
+  animation: spin 0.9s linear infinite;
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.connection-band {
+  align-items: end;
+  display: grid;
+  gap: 12px;
+  grid-template-columns: minmax(220px, 1.5fr) minmax(140px, 0.7fr) auto minmax(180px, 1fr);
+  padding: 14px;
+}
+
+label {
+  color: #526176;
+  display: grid;
+  font-size: 12px;
+  font-weight: 700;
+  gap: 6px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.symbols {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.symbols button {
+  min-height: 32px;
+  padding: 6px 10px;
+}
+
+.symbols .selected {
+  background: #172033;
+  border-color: #172033;
+  color: #ffffff;
+}
+
+.market-strip {
+  display: grid;
+  gap: 1px;
+  grid-template-columns: repeat(4, 1fr);
+  overflow: hidden;
+}
+
+.metric {
+  background: #ffffff;
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+  padding: 14px;
+}
+
+.metric span {
+  color: #66758b;
+  font-size: 12px;
+  font-weight: 700;
+  text-transform: uppercase;
+}
+
+.metric strong {
+  font-size: 22px;
+  letter-spacing: 0;
+  overflow-wrap: anywhere;
+}
+
+.workspace {
+  align-items: start;
+  display: grid;
+  gap: 16px;
+  grid-template-columns: minmax(420px, 1.25fr) minmax(330px, 0.85fr);
+}
+
+.panel {
+  min-width: 0;
+  padding: 14px;
+}
+
+.book-panel {
+  grid-row: span 2;
+}
+
+.panel-title {
+  align-items: center;
+  border-bottom: 1px solid #edf1f5;
+  display: flex;
+  gap: 9px;
+  margin: -2px 0 14px;
+  padding-bottom: 12px;
+}
+
+.panel-title h2 {
+  font-size: 16px;
+  letter-spacing: 0;
+  margin: 0;
+}
+
+.book-grid {
+  display: grid;
+  gap: 12px;
+  grid-template-columns: 1fr 1fr;
+}
+
+.book-side {
+  border: 1px solid #edf1f5;
+  border-radius: 8px;
+  min-height: 360px;
+  overflow: hidden;
+}
+
+.book-head,
+.book-row {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+}
+
+.book-head {
+  background: #f7f9fb;
+  color: #66758b;
+  font-size: 12px;
+  font-weight: 800;
+  padding: 10px;
+  text-transform: uppercase;
+}
+
+.book-head span:last-child,
+.book-row span {
+  text-align: right;
+}
+
+.book-row {
+  min-height: 36px;
+  padding: 9px 10px;
+  position: relative;
+}
+
+.book-row strong,
+.book-row span {
+  font-variant-numeric: tabular-nums;
+  position: relative;
+  z-index: 1;
+}
+
+.bar {
+  bottom: 3px;
+  opacity: 0.2;
+  position: absolute;
+  right: 3px;
+  top: 3px;
+}
+
+.bid .book-row strong {
+  color: #137447;
+}
+
+.ask .book-row strong {
+  color: #b64236;
+}
+
+.bid .bar {
+  background: #20a66b;
+}
+
+.ask .bar {
+  background: #d95d50;
+}
+
+.form-grid {
+  display: grid;
+  gap: 12px;
+  grid-template-columns: 1fr 1fr;
+}
+
+.form-grid .segmented,
+.form-grid .primary,
+.form-grid > button {
+  grid-column: 1 / -1;
+}
+
+.form-grid.compact {
+  margin-bottom: 14px;
+}
+
+.segmented {
+  background: #eef2f6;
+  border: 1px solid #dce2ea;
+  border-radius: 8px;
+  display: grid;
+  gap: 4px;
+  grid-auto-flow: column;
+  padding: 4px;
+}
+
+.segmented button {
+  background: transparent;
+  border-color: transparent;
+  min-height: 34px;
+}
+
+.segmented button.active {
+  background: #ffffff;
+  border-color: #c8d0dc;
+  box-shadow: 0 1px 2px rgba(21, 31, 48, 0.08);
+}
+
+.primary.buy {
+  background: #137447;
+  border-color: #137447;
+  color: #ffffff;
+}
+
+.primary.sell,
+.danger {
+  background: #b64236;
+  border-color: #b64236;
+  color: #ffffff;
+}
+
+.cancel-row {
+  align-items: end;
+  display: grid;
+  gap: 12px;
+  grid-template-columns: 1fr auto;
+}
+
+.activity-list {
+  display: grid;
+  gap: 8px;
+}
+
+.activity-item {
+  border-left: 3px solid #c8d0dc;
+  display: grid;
+  gap: 4px;
+  padding: 9px 10px;
+}
+
+.activity-item strong,
+.activity-item span {
+  overflow-wrap: anywhere;
+}
+
+.activity-item span {
+  color: #526176;
+  font-size: 14px;
+}
+
+.activity-item.ok {
+  border-color: #20a66b;
+}
+
+.activity-item.bad {
+  border-color: #d95d50;
+}
+
+.empty-state {
+  color: #8a97a8;
+  padding: 16px;
+  text-align: center;
+}
+
+@media (max-width: 980px) {
+  .connection-band,
+  .workspace {
+    grid-template-columns: 1fr;
+  }
+
+  .book-panel {
+    grid-row: auto;
+  }
+}
+
+@media (max-width: 680px) {
+  .shell {
+    padding: 10px;
+  }
+
+  .topbar {
+    align-items: start;
+    flex-direction: column;
+    gap: 12px;
+  }
+
+  .market-strip,
+  .book-grid,
+  .form-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .segmented {
+    grid-auto-flow: row;
+  }
+
+  .cancel-row {
+    grid-template-columns: 1fr;
+  }
+}

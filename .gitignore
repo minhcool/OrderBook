@@ -1,0 +1,9 @@
+build/
+*.exe
+
+web/node_modules/
+web/dist/
+web/.vite/
+*.tsbuildinfo
+
+*.log
