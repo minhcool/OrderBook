@@ -49,6 +49,8 @@ Expected health response:
 { "ok": true }
 ```
 
+Fresh deploys start with empty `BTC-USD` and `ETH-USD` books, so `/symbols` should return both symbols before any trades happen.
+
 ## If Render Fails
 
 Open the `orderbook-api` service, then check:

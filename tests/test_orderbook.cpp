@@ -337,6 +337,13 @@ void test_book_snapshot() {
 void test_exchange_routes_by_symbol() {
     Exchange exchange;
 
+    exchange.ensureBook("ETH-USD");
+    std::vector<std::string> initialSymbols = exchange.symbols();
+    assert(initialSymbols.size() == 1);
+    assert(initialSymbols[0] == "ETH-USD");
+    assert(exchange.snapshot("ETH-USD").bids.empty());
+    assert(exchange.snapshot("ETH-USD").asks.empty());
+
     assert(exchange.sell("BTC-USD", 10, 1, 100, 5).accepted);
     assert(exchange.buy("ETH-USD", 20, 2, 50, 7).accepted);
 

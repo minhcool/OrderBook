@@ -722,6 +722,11 @@ SocketHandle createServerSocket(int port) {
     return server;
 }
 
+void seedDefaultBooks(Exchange& exchange) {
+    exchange.ensureBook("BTC-USD");
+    exchange.ensureBook("ETH-USD");
+}
+
 int parsePort(const char* value, int fallback) {
     if (value == nullptr || value[0] == '\0') {
         return fallback;
@@ -748,6 +753,7 @@ int main(int argc, char** argv) {
         SocketRuntime runtime;
         SocketHandle server = createServerSocket(port);
         Exchange exchange;
+        seedDefaultBooks(exchange);
 
         std::cout << "Orderbook API server listening on 0.0.0.0:" << port << "\n";
         std::cout << "Press Ctrl+C to stop.\n";

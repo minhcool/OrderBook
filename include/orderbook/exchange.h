@@ -10,6 +10,8 @@
 
 class Exchange {
 public:
+    void ensureBook(const std::string& symbol);
+
     SubmitResult buy(const std::string& symbol, TraderId traderId, OrderId orderId, Price price, Qty quantity);
     SubmitResult sell(const std::string& symbol, TraderId traderId, OrderId orderId, Price price, Qty quantity);
     SubmitResult marketBuy(const std::string& symbol, TraderId traderId, OrderId orderId, Qty quantity);

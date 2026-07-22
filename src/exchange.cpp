@@ -3,6 +3,10 @@
 #include <algorithm>
 #include <utility>
 
+void Exchange::ensureBook(const std::string& symbol) {
+    (void)getOrCreateBook(symbol);
+}
+
 SubmitResult Exchange::buy(const std::string& symbol, TraderId traderId, OrderId orderId, Price price, Qty quantity) {
     return getOrCreateBook(symbol).buy(traderId, orderId, price, quantity);
 }

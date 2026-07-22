@@ -28,6 +28,7 @@ Stop it with `Ctrl+C`.
 - The server stores all state in memory.
 - Restarting the server clears all books.
 - One symbol maps to one orderbook.
+- The API server starts with empty `BTC-USD` and `ETH-USD` books.
 - Request bodies are flat JSON objects.
 - The parser is intentionally tiny and only supports the fields shown here.
 - POST order endpoints require `Authorization: Bearer <Clerk session token>`.
