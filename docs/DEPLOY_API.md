@@ -49,6 +49,16 @@ Expected health response:
 { "ok": true }
 ```
 
+## If Render Fails
+
+Open the `orderbook-api` service, then check:
+
+```text
+Events -> latest failed deploy -> Logs
+```
+
+The Blueprint page only says that deploy failed. The service logs show whether the failure happened while building the Docker image, starting the binary, or passing the `/health` check.
+
 ## Connect Vercel
 
 In the Vercel frontend project, set:
