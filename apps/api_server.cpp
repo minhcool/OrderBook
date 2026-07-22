@@ -19,6 +19,7 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 using SocketHandle = SOCKET;
+using SocketLength = int;
 constexpr SocketHandle InvalidSocket = INVALID_SOCKET;
 #else
 #include <arpa/inet.h>
@@ -26,6 +27,7 @@ constexpr SocketHandle InvalidSocket = INVALID_SOCKET;
 #include <sys/socket.h>
 #include <unistd.h>
 using SocketHandle = int;
+using SocketLength = socklen_t;
 constexpr SocketHandle InvalidSocket = -1;
 #endif
 
@@ -115,6 +117,8 @@ std::string statusText(int status) {
             return "OK";
         case 400:
             return "Bad Request";
+        case 401:
+            return "Unauthorized";
         case 404:
             return "Not Found";
         case 405:
@@ -718,12 +722,26 @@ SocketHandle createServerSocket(int port) {
     return server;
 }
 
+int parsePort(const char* value, int fallback) {
+    if (value == nullptr || value[0] == '\0') {
+        return fallback;
+    }
+
+    char* end = nullptr;
+    const long port = std::strtol(value, &end, 10);
+    if (end == value || *end != '\0' || port <= 0 || port > 65535) {
+        throw std::runtime_error("invalid port");
+    }
+
+    return static_cast<int>(port);
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
-    int port = 8080;
+    int port = parsePort(std::getenv("PORT"), 8080);
     if (argc >= 2) {
-        port = std::atoi(argv[1]);
+        port = parsePort(argv[1], port);
     }
 
     try {
@@ -731,12 +749,12 @@ int main(int argc, char** argv) {
         SocketHandle server = createServerSocket(port);
         Exchange exchange;
 
-        std::cout << "Orderbook API server listening on http://localhost:" << port << "\n";
+        std::cout << "Orderbook API server listening on 0.0.0.0:" << port << "\n";
         std::cout << "Press Ctrl+C to stop.\n";
 
         while (true) {
             sockaddr_in clientAddress{};
-            int clientAddressSize = sizeof(clientAddress);
+            SocketLength clientAddressSize = sizeof(clientAddress);
             SocketHandle client = accept(server, reinterpret_cast<sockaddr*>(&clientAddress), &clientAddressSize);
             if (client == InvalidSocket) {
                 continue;

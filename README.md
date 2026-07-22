@@ -116,6 +116,8 @@ For local HTTP GET/POST endpoints, see [docs/HTTP_API.md](docs/HTTP_API.md).
 
 For the Vercel-ready website, see [docs/WEBSITE.md](docs/WEBSITE.md).
 
+For deploying the C++ API server, see [docs/DEPLOY_API.md](docs/DEPLOY_API.md).
+
 ## Current Limitations
 
 - No CLI yet.

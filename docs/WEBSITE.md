@@ -49,6 +49,8 @@ On Vercel:
 
 Important: Vercel should host the frontend first. The current C++ API server is stateful and should run separately on a server/VPS/container that can keep one process alive.
 
+For API deployment steps, see [DEPLOY_API.md](DEPLOY_API.md).
+
 ## API URL
 
 For local development:
