@@ -7,16 +7,13 @@ COPY src ./src
 COPY apps ./apps
 
 RUN g++ -std=c++20 -O2 -DNDEBUG -Wall -Wextra -pedantic -pthread \
+    -static-libstdc++ -static-libgcc \
     -Iinclude apps/api_server.cpp src/orderbook.cpp src/exchange.cpp \
     -o /orderbook_api
 
 FROM debian:bookworm-slim
 
 WORKDIR /app
-
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends libstdc++6 ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
 
 COPY --from=build /orderbook_api ./orderbook_api
 
