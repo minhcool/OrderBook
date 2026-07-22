@@ -4,6 +4,11 @@ build/
 web/node_modules/
 web/dist/
 web/.vite/
+web/.env
+web/.env.local
+web/.env.development.local
+web/.env.test.local
+web/.env.production.local
 *.tsbuildinfo
 
 *.log

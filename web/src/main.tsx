@@ -1,6 +1,6 @@
 import React from "react";
 import ReactDOM from "react-dom/client";
-import { ClerkProvider, SignInButton, SignedIn, SignedOut, UserButton, useAuth, useUser } from "@clerk/clerk-react";
+import { ClerkProvider, Show, SignInButton, SignUpButton, UserButton, useAuth, useUser } from "@clerk/react";
 import { Activity, CircleOff, Eraser, PlugZap, RefreshCw, Replace, Send, Server, Wifi, WifiOff } from "lucide-react";
 
 import { cancelOrder, fetchBook, fetchSymbols, health, replaceOrder, submitOrder } from "./api";
@@ -163,15 +163,18 @@ function App() {
           <p>{symbol}</p>
         </div>
         <div className="status-row">
-          <SignedIn>
+          <Show when="signed-in">
             <span className="user-pill">{signedInName}</span>
-            <UserButton afterSignOutUrl="/" />
-          </SignedIn>
-          <SignedOut>
+            <UserButton />
+          </Show>
+          <Show when="signed-out">
             <SignInButton mode="modal">
               <button type="button">Sign in</button>
             </SignInButton>
-          </SignedOut>
+            <SignUpButton mode="modal">
+              <button type="button">Sign up</button>
+            </SignUpButton>
+          </Show>
           <span className={`status ${apiOnline ? "online" : "offline"}`}>
             {apiOnline ? <Wifi size={16} /> : <WifiOff size={16} />}
             {apiOnline ? "API online" : "API offline"}
@@ -230,12 +233,12 @@ function App() {
           </div>
 
           <form className="form-grid" onSubmit={handleSubmitOrder}>
-            <SignedOut>
+            <Show when="signed-out">
               <div className="auth-callout">
                 <strong>Sign in required</strong>
                 <span>Orders are tied to your Clerk user. Trader ID is assigned by the API.</span>
               </div>
-            </SignedOut>
+            </Show>
             <Segmented<Side> value={side} onChange={setSide} options={[
               { label: "Buy", value: "buy" },
               { label: "Sell", value: "sell" }
@@ -272,12 +275,12 @@ function App() {
           </div>
 
           <form className="form-grid compact" onSubmit={handleReplace}>
-            <SignedOut>
+            <Show when="signed-out">
               <div className="auth-callout">
                 <strong>Sign in required</strong>
                 <span>Only authenticated users can replace or cancel orders.</span>
               </div>
-            </SignedOut>
+            </Show>
             <Segmented<Side> value={replaceSide} onChange={setReplaceSide} options={[
               { label: "Buy", value: "buy" },
               { label: "Sell", value: "sell" }

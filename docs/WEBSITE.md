@@ -18,7 +18,6 @@ Terminal 2:
 ```powershell
 cd C:\Users\nqmin\Documents\Projects\Orderbook\web
 npm install
-Copy-Item .env.example .env
 npm run dev
 ```
 
@@ -72,8 +71,9 @@ The C++ API server now includes basic CORS headers for browser requests.
 
 1. Create a Clerk application.
 2. Enable the OAuth providers you want, such as Google or GitHub.
-3. Copy the publishable key.
-4. Add it locally to `web/.env`.
-5. Add it in Vercel as `VITE_CLERK_PUBLISHABLE_KEY`.
+3. Run `clerk auth login`.
+4. Run `clerk init --app app_3GqtszmnEQINzeFX8CUrXDhCXXz` from `web/`.
+5. Keep the generated `web/.env.local` local; it is intentionally ignored by Git.
+6. Add the publishable key in Vercel as `VITE_CLERK_PUBLISHABLE_KEY`.
 
 The current backend reads the Clerk token subject and maps it to an internal `TraderId`. It still needs real Clerk JWT verification before production use.
