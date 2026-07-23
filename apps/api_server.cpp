@@ -3,11 +3,14 @@
 #include <algorithm>
 #include <atomic>
 #include <cctype>
+#include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <exception>
 #include <iomanip>
 #include <iostream>
+#include <limits>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -20,6 +23,10 @@
 #include <unordered_map>
 #include <utility>
 #include <vector>
+
+#ifdef ORDERBOOK_WITH_POSTGRES
+#include <libpq-fe.h>
+#endif
 
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
@@ -59,10 +66,69 @@ public:
         : std::runtime_error(message) {}
 };
 
+using Clock = std::chrono::system_clock;
+using TimePoint = Clock::time_point;
+
+std::int64_t epochSeconds(TimePoint value) {
+    return std::chrono::duration_cast<std::chrono::seconds>(value.time_since_epoch()).count();
+}
+
+std::int64_t secondsRemaining(TimePoint deadline, TimePoint now = Clock::now()) {
+    if (deadline <= now) {
+        return 0;
+    }
+
+    return std::chrono::duration_cast<std::chrono::seconds>(deadline - now).count();
+}
+
+std::int64_t envInt64(const char* name, std::int64_t fallback) {
+    const char* value = std::getenv(name);
+    if (value == nullptr || value[0] == '\0') {
+        return fallback;
+    }
+
+    char* end = nullptr;
+    const long long parsed = std::strtoll(value, &end, 10);
+    if (end == value || *end != '\0') {
+        throw std::runtime_error(std::string("invalid integer env var: ") + name);
+    }
+
+    return parsed;
+}
+
+struct GameConfig {
+    std::int64_t startingCash = 100000;
+    int startDelaySeconds = 90;
+    int gameDurationSeconds = 600;
+    int rejoinCooldownSeconds = 60;
+
+    static GameConfig fromEnvironment() {
+        GameConfig config;
+        config.startingCash = envInt64("ORDERBOOK_STARTING_CASH", config.startingCash);
+        config.startDelaySeconds = static_cast<int>(std::max<std::int64_t>(
+            0,
+            envInt64("ORDERBOOK_START_DELAY_SECONDS", config.startDelaySeconds)));
+        config.gameDurationSeconds = static_cast<int>(std::max<std::int64_t>(
+            60,
+            envInt64("ORDERBOOK_GAME_DURATION_SECONDS", config.gameDurationSeconds)));
+        config.rejoinCooldownSeconds = static_cast<int>(std::max<std::int64_t>(
+            0,
+            envInt64("ORDERBOOK_REJOIN_COOLDOWN_SECONDS", config.rejoinCooldownSeconds)));
+        return config;
+    }
+};
+
 class OrderIdGenerator {
 public:
     OrderId next() {
         return nextId.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    void setNextAtLeast(OrderId candidate) {
+        OrderId current = nextId.load(std::memory_order_relaxed);
+        while (current < candidate
+            && !nextId.compare_exchange_weak(current, candidate, std::memory_order_relaxed)) {
+        }
     }
 
 private:
@@ -135,6 +201,10 @@ struct PortfolioRecord {
     TraderId traderId = 0;
     std::int64_t startingCash = 0;
     std::int64_t cashFlow = 0;
+    std::int64_t cash = 0;
+    std::int64_t reservedCash = 0;
+    std::int64_t availableCash = 0;
+    Qty reservedLongQuantity = 0;
     double marketValue = 0.0;
     double estimatedValue = 0.0;
     double tradingPnl = 0.0;
@@ -230,20 +300,37 @@ public:
         return positionsForTraderLocked(traderId);
     }
 
-    PortfolioRecord portfolioForTrader(TraderId traderId, std::int64_t startingCash = 0) const {
+    std::int64_t cashFlowForTrader(TraderId traderId) const {
+        std::lock_guard<std::mutex> lock(accountMutex);
+        return cashFlowForTraderLocked(traderId);
+    }
+
+    Qty positionQuantityForTrader(TraderId traderId, const std::string& symbol) const {
+        std::lock_guard<std::mutex> lock(accountMutex);
+        return positionQuantityForTraderLocked(traderId, symbol);
+    }
+
+    PortfolioRecord portfolioForTrader(
+        TraderId traderId,
+        std::int64_t startingCash = 0,
+        std::int64_t reservedCash = 0,
+        Qty reservedLongQuantity = 0) const {
         std::lock_guard<std::mutex> lock(accountMutex);
 
         PortfolioRecord portfolio;
         portfolio.traderId = traderId;
         portfolio.startingCash = startingCash;
+        portfolio.cashFlow = cashFlowForTraderLocked(traderId);
+        portfolio.cash = portfolio.startingCash + portfolio.cashFlow;
+        portfolio.reservedCash = reservedCash;
+        portfolio.availableCash = portfolio.cash - portfolio.reservedCash;
+        portfolio.reservedLongQuantity = reservedLongQuantity;
         const std::vector<PositionRecord> positions = positionsForTraderLocked(traderId);
         portfolio.positions.reserve(positions.size());
 
         for (const PositionRecord& position : positions) {
             PortfolioPositionRecord marked;
             marked.position = position;
-
-            portfolio.cashFlow += position.quoteCashFlow;
 
             const PriceRecord price = priceForSymbolLocked(position.symbol);
             if (price.hasPrice) {
@@ -261,7 +348,7 @@ public:
         }
 
         portfolio.tradingPnl = static_cast<double>(portfolio.cashFlow) + portfolio.marketValue;
-        portfolio.estimatedValue = static_cast<double>(portfolio.startingCash) + portfolio.tradingPnl;
+        portfolio.estimatedValue = static_cast<double>(portfolio.cash) + portfolio.marketValue;
         return portfolio;
     }
 
@@ -363,6 +450,32 @@ private:
         return result;
     }
 
+    std::int64_t cashFlowForTraderLocked(TraderId traderId) const {
+        std::int64_t cashFlow = 0;
+        for (const FillRecord& fill : fills) {
+            if (fill.traderId != traderId) {
+                continue;
+            }
+
+            cashFlow += fill.side == Side::Buy ? -fill.notional : fill.notional;
+        }
+
+        return cashFlow;
+    }
+
+    Qty positionQuantityForTraderLocked(TraderId traderId, const std::string& symbol) const {
+        Qty quantity = 0;
+        for (const FillRecord& fill : fills) {
+            if (fill.traderId != traderId || fill.symbol != symbol) {
+                continue;
+            }
+
+            quantity += fill.side == Side::Buy ? fill.quantity : -fill.quantity;
+        }
+
+        return quantity;
+    }
+
     static void applyEntryPrice(MutablePosition& position, const FillRecord& fill) {
         const Qty signedQuantity = fill.side == Side::Buy ? fill.quantity : -fill.quantity;
         const double fillPrice = static_cast<double>(fill.price);
@@ -451,6 +564,18 @@ enum class RoomMode {
     Competitive,
 };
 
+enum class ParticipantTrack {
+    Manual,
+    Bot,
+};
+
+enum class LobbyPhase {
+    Waiting,
+    Starting,
+    Running,
+    Finished,
+};
+
 struct AssetConfig {
     std::string symbol;
     std::string displayName;
@@ -467,6 +592,9 @@ struct GameRoom {
     std::string difficulty;
     std::int64_t startingCash = 100000;
     int maxParticipants = 1;
+    int startDelaySeconds = 0;
+    int gameDurationSeconds = 600;
+    int rejoinCooldownSeconds = 60;
     bool houseLiquidity = true;
     Exchange exchange;
     AccountStore accounts;
@@ -483,6 +611,51 @@ enum class LobbyJoinResult {
     Joined,
     AlreadyJoined,
     Full,
+    ActiveElsewhere,
+    CoolingDown,
+    GameClosed,
+};
+
+struct LobbyMembershipRecord {
+    TraderId traderId = 0;
+    ParticipantTrack track = ParticipantTrack::Manual;
+    TimePoint joinedAt{};
+};
+
+struct RatingRecord {
+    TraderId traderId = 0;
+    ParticipantTrack track = ParticipantTrack::Manual;
+    int ratingBefore = 1200;
+    int ratingAfter = 1200;
+    double score = 0.0;
+};
+
+struct LeaderboardRow {
+    TraderId traderId = 0;
+    ParticipantTrack track = ParticipantTrack::Manual;
+    double pnl = 0.0;
+    double estimatedValue = 0.0;
+    int ratingBefore = 1200;
+    int ratingAfter = 1200;
+};
+
+struct LobbyJoinOutcome {
+    LobbyJoinResult result = LobbyJoinResult::Joined;
+    std::int64_t cooldownRemainingSeconds = 0;
+    std::string activeLobbyId;
+};
+
+LobbyJoinOutcome makeJoinOutcome(
+    LobbyJoinResult result,
+    std::int64_t cooldownRemainingSeconds = 0,
+    const std::string& activeLobbyId = "") {
+    return {result, cooldownRemainingSeconds, activeLobbyId};
+}
+
+struct ActiveSession {
+    std::string id;
+    std::string roomId;
+    bool competitive = false;
 };
 
 struct CompetitiveLobby {
@@ -490,40 +663,251 @@ struct CompetitiveLobby {
     std::string name;
     std::string roomId;
     int capacity = 0;
+    int startDelaySeconds = 90;
+    int gameDurationSeconds = 600;
     std::unique_ptr<GameRoom> game;
 
-    LobbyJoinResult join(TraderId traderId) {
+    LobbyJoinResult join(TraderId traderId, ParticipantTrack track) {
         std::lock_guard<std::mutex> lock(participantMutex);
-        if (participantIds.contains(traderId)) {
+        const TimePoint now = Clock::now();
+        updatePhaseLocked(now);
+
+        if (participants.contains(traderId)) {
             return LobbyJoinResult::AlreadyJoined;
         }
 
-        if (participantIds.size() >= static_cast<std::size_t>(capacity)) {
+        const auto admitted = admittedParticipants.find(traderId);
+        const bool returningParticipant = admitted != admittedParticipants.end();
+        if (phase == LobbyPhase::Finished
+            || (phase == LobbyPhase::Running && !returningParticipant)) {
+            return LobbyJoinResult::GameClosed;
+        }
+
+        if (participants.size() >= static_cast<std::size_t>(capacity)) {
             return LobbyJoinResult::Full;
         }
 
-        participantIds.insert(traderId);
+        const ParticipantTrack admittedTrack = returningParticipant ? admitted->second.track : track;
+        const LobbyMembershipRecord membership{traderId, admittedTrack, now};
+        participants[traderId] = membership;
+        admittedParticipants.emplace(traderId, membership);
+        maybeScheduleStartLocked(now);
         return LobbyJoinResult::Joined;
     }
 
     bool leave(TraderId traderId) {
         std::lock_guard<std::mutex> lock(participantMutex);
-        return participantIds.erase(traderId) > 0;
+        updatePhaseLocked(Clock::now());
+        const bool left = participants.erase(traderId) > 0;
+
+        if (participants.empty() && (phase == LobbyPhase::Waiting || phase == LobbyPhase::Starting)) {
+            phase = LobbyPhase::Waiting;
+            startsAt.reset();
+            endsAt.reset();
+        } else if (participants.empty() && phase == LobbyPhase::Running) {
+            phase = LobbyPhase::Finished;
+        } else if (phase == LobbyPhase::Starting && participants.size() < static_cast<std::size_t>(minStartParticipants())) {
+            phase = LobbyPhase::Waiting;
+            startsAt.reset();
+            endsAt.reset();
+        }
+
+        return left;
     }
 
     bool contains(TraderId traderId) const {
         std::lock_guard<std::mutex> lock(participantMutex);
-        return participantIds.contains(traderId);
+        return participants.contains(traderId);
+    }
+
+    bool wasAdmitted(TraderId traderId) const {
+        std::lock_guard<std::mutex> lock(participantMutex);
+        return admittedParticipants.contains(traderId);
+    }
+
+    std::optional<LobbyMembershipRecord> membershipFor(TraderId traderId) const {
+        std::lock_guard<std::mutex> lock(participantMutex);
+        const auto found = participants.find(traderId);
+        if (found == participants.end()) {
+            return std::nullopt;
+        }
+
+        return found->second;
     }
 
     std::size_t participantCount() const {
         std::lock_guard<std::mutex> lock(participantMutex);
-        return participantIds.size();
+        return participants.size();
+    }
+
+    int minStartParticipants() const {
+        return std::max(1, (capacity + 1) / 2);
+    }
+
+    LobbyPhase currentPhase() const {
+        std::lock_guard<std::mutex> lock(participantMutex);
+        updatePhaseLocked(Clock::now());
+        return phase;
+    }
+
+    std::optional<TimePoint> currentStartsAt() const {
+        std::lock_guard<std::mutex> lock(participantMutex);
+        updatePhaseLocked(Clock::now());
+        return startsAt;
+    }
+
+    std::optional<TimePoint> currentEndsAt() const {
+        std::lock_guard<std::mutex> lock(participantMutex);
+        updatePhaseLocked(Clock::now());
+        return endsAt;
+    }
+
+    std::int64_t startsInSeconds() const {
+        std::lock_guard<std::mutex> lock(participantMutex);
+        updatePhaseLocked(Clock::now());
+        return startsAt ? secondsRemaining(*startsAt) : 0;
+    }
+
+    std::int64_t endsInSeconds() const {
+        std::lock_guard<std::mutex> lock(participantMutex);
+        updatePhaseLocked(Clock::now());
+        return endsAt ? secondsRemaining(*endsAt) : 0;
+    }
+
+    std::vector<LobbyMembershipRecord> participantRecords() const {
+        std::lock_guard<std::mutex> lock(participantMutex);
+        std::vector<LobbyMembershipRecord> result;
+        result.reserve(participants.size());
+        for (const auto& [traderId, membership] : participants) {
+            (void)traderId;
+            result.push_back(membership);
+        }
+
+        return result;
+    }
+
+    void finalizeIfNeeded(const std::unordered_map<TraderId, int>& manualRatings,
+        const std::unordered_map<TraderId, int>& botRatings) {
+        std::lock_guard<std::mutex> lock(participantMutex);
+        updatePhaseLocked(Clock::now());
+        if (phase != LobbyPhase::Finished || ratingsFinalized) {
+            return;
+        }
+
+        leaderboard.clear();
+        std::map<ParticipantTrack, std::vector<LeaderboardRow>> rowsByTrack;
+        for (const auto& [traderId, membership] : admittedParticipants) {
+            const PortfolioRecord portfolio = game->accounts.portfolioForTrader(
+                traderId,
+                game->startingCash,
+                reservedCashForTrader(*game, traderId),
+                reservedSellQuantityForTrader(*game, traderId));
+
+            const auto& ratingBook = membership.track == ParticipantTrack::Bot ? botRatings : manualRatings;
+            const auto foundRating = ratingBook.find(traderId);
+            const int ratingBefore = foundRating == ratingBook.end() ? 1200 : foundRating->second;
+
+            rowsByTrack[membership.track].push_back({
+                traderId,
+                membership.track,
+                portfolio.tradingPnl,
+                portfolio.estimatedValue,
+                ratingBefore,
+                ratingBefore,
+            });
+        }
+
+        for (auto& [track, rows] : rowsByTrack) {
+            (void)track;
+            applyElo(rows);
+            leaderboard.insert(leaderboard.end(), rows.begin(), rows.end());
+        }
+
+        std::sort(leaderboard.begin(), leaderboard.end(), [](const LeaderboardRow& left, const LeaderboardRow& right) {
+            if (left.track != right.track) {
+                return static_cast<int>(left.track) < static_cast<int>(right.track);
+            }
+
+            return left.estimatedValue > right.estimatedValue;
+        });
+
+        ratingsFinalized = true;
+    }
+
+    bool hasFinalRatings() const {
+        std::lock_guard<std::mutex> lock(participantMutex);
+        return ratingsFinalized;
+    }
+
+    std::vector<LeaderboardRow> leaderboardRows() const {
+        std::lock_guard<std::mutex> lock(participantMutex);
+        return leaderboard;
     }
 
 private:
+    void maybeScheduleStartLocked(TimePoint now) {
+        if (phase != LobbyPhase::Waiting || participants.size() < static_cast<std::size_t>(minStartParticipants())) {
+            return;
+        }
+
+        startsAt = now + std::chrono::seconds(startDelaySeconds);
+        endsAt = *startsAt + std::chrono::seconds(gameDurationSeconds);
+        phase = startDelaySeconds == 0 ? LobbyPhase::Running : LobbyPhase::Starting;
+    }
+
+    void updatePhaseLocked(TimePoint now) const {
+        if (phase == LobbyPhase::Finished) {
+            return;
+        }
+
+        if (startsAt && now >= *startsAt && phase == LobbyPhase::Starting) {
+            phase = LobbyPhase::Running;
+        }
+
+        if (endsAt && now >= *endsAt) {
+            phase = LobbyPhase::Finished;
+        }
+    }
+
+    static double expectedScore(int leftRating, int rightRating) {
+        return 1.0 / (1.0 + std::pow(10.0, static_cast<double>(rightRating - leftRating) / 400.0));
+    }
+
+    static void applyElo(std::vector<LeaderboardRow>& rows) {
+        constexpr double K = 32.0;
+        if (rows.size() < 2) {
+            return;
+        }
+
+        std::vector<double> deltas(rows.size(), 0.0);
+        for (std::size_t i = 0; i < rows.size(); ++i) {
+            for (std::size_t j = i + 1; j < rows.size(); ++j) {
+                const double actualI =
+                    rows[i].estimatedValue > rows[j].estimatedValue ? 1.0
+                    : rows[i].estimatedValue < rows[j].estimatedValue ? 0.0
+                    : 0.5;
+                const double expectedI = expectedScore(rows[i].ratingBefore, rows[j].ratingBefore);
+                deltas[i] += K * (actualI - expectedI);
+                deltas[j] += K * ((1.0 - actualI) - (1.0 - expectedI));
+            }
+        }
+
+        for (std::size_t i = 0; i < rows.size(); ++i) {
+            rows[i].ratingAfter = static_cast<int>(std::llround(rows[i].ratingBefore + deltas[i]));
+        }
+    }
+
+    static std::int64_t reservedCashForTrader(const GameRoom& room, TraderId traderId);
+    static Qty reservedSellQuantityForTrader(const GameRoom& room, TraderId traderId);
+
     mutable std::mutex participantMutex;
-    std::set<TraderId> participantIds;
+    std::map<TraderId, LobbyMembershipRecord> participants;
+    std::map<TraderId, LobbyMembershipRecord> admittedParticipants;
+    mutable LobbyPhase phase = LobbyPhase::Waiting;
+    mutable std::optional<TimePoint> startsAt;
+    mutable std::optional<TimePoint> endsAt;
+    bool ratingsFinalized = false;
+    std::vector<LeaderboardRow> leaderboard;
 };
 
 struct ParsedLobbyPath {
@@ -531,24 +915,54 @@ struct ParsedLobbyPath {
     std::string nestedPath;
 };
 
+struct SinglePlayerSession {
+    std::string id;
+    std::string roomId;
+    TraderId traderId = 0;
+    std::unique_ptr<GameRoom> game;
+    TimePoint joinedAt{};
+    bool active = true;
+};
+
 class RoomStore {
 public:
-    RoomStore();
+    explicit RoomStore(GameConfig config);
 
     GameRoom* find(const std::string& roomId);
     CompetitiveLobby* findLobby(const std::string& lobbyId);
-    GameRoom& defaultRoom();
+    SinglePlayerSession* findSingleSession(const std::string& roomId, TraderId traderId);
     std::vector<const GameRoom*> rooms() const;
     std::vector<const CompetitiveLobby*> lobbies() const;
     std::vector<const CompetitiveLobby*> lobbiesForRoom(const std::string& roomId) const;
+    LobbyJoinOutcome joinSingleRoom(const std::string& roomId, TraderId traderId);
+    bool leaveSingleRoom(const std::string& roomId, TraderId traderId);
+    LobbyJoinOutcome joinCompetitiveLobby(const std::string& lobbyId, TraderId traderId, ParticipantTrack track);
+    bool leaveCompetitiveLobby(const std::string& lobbyId, TraderId traderId);
+    bool hasActiveSession(TraderId traderId, const std::string& sessionId) const;
+    std::optional<ActiveSession> activeSessionFor(TraderId traderId) const;
+    std::int64_t cooldownRemainingSeconds(TraderId traderId) const;
+    const GameConfig& config() const;
+    std::unordered_map<TraderId, int>& ratings(ParticipantTrack track);
+    bool storeLeaderboardRatings(const CompetitiveLobby& lobby);
 
 private:
     void addRoom(std::unique_ptr<GameRoom> room);
     void addLobby(std::unique_ptr<CompetitiveLobby> lobby);
+    std::unique_ptr<GameRoom> cloneSingleRoom(const GameRoom& room) const;
+    LobbyJoinOutcome canJoinSessionLocked(TraderId traderId, const std::string& sessionId) const;
+    void markJoinedLocked(TraderId traderId, const ActiveSession& session);
+    void markLeftLocked(TraderId traderId);
 
+    GameConfig gameConfig;
+    mutable std::mutex sessionMutex;
     std::map<std::string, std::unique_ptr<GameRoom>> roomById;
     std::map<std::string, std::unique_ptr<CompetitiveLobby>> lobbyById;
-    std::string defaultRoomId = "sandbox";
+    std::map<std::string, std::map<TraderId, std::unique_ptr<SinglePlayerSession>>> singleSessionsByRoom;
+    std::map<TraderId, ActiveSession> activeByTrader;
+    std::map<TraderId, TimePoint> cooldownUntilByTrader;
+    std::unordered_map<TraderId, int> manualRatings;
+    std::unordered_map<TraderId, int> botRatings;
+    std::set<std::string> storedRatingLobbies;
 };
 
 #ifdef _WIN32
@@ -611,10 +1025,14 @@ std::string statusText(int status) {
             return "Bad Request";
         case 401:
             return "Unauthorized";
+        case 403:
+            return "Forbidden";
         case 404:
             return "Not Found";
         case 405:
             return "Method Not Allowed";
+        case 409:
+            return "Conflict";
         case 500:
             return "Internal Server Error";
         default:
@@ -677,6 +1095,29 @@ std::string sideToString(Side side) {
 
 std::string roomModeToString(RoomMode mode) {
     return mode == RoomMode::Single ? "single" : "competitive";
+}
+
+std::string participantTrackToString(ParticipantTrack track) {
+    return track == ParticipantTrack::Bot ? "bot" : "manual";
+}
+
+ParticipantTrack parseParticipantTrack(const std::string& value) {
+    return lower(value) == "bot" ? ParticipantTrack::Bot : ParticipantTrack::Manual;
+}
+
+std::string lobbyPhaseToString(LobbyPhase phase) {
+    switch (phase) {
+        case LobbyPhase::Waiting:
+            return "waiting";
+        case LobbyPhase::Starting:
+            return "starting";
+        case LobbyPhase::Running:
+            return "running";
+        case LobbyPhase::Finished:
+            return "finished";
+    }
+
+    return "waiting";
 }
 
 std::string jsonError(const std::string& message) {
@@ -802,7 +1243,7 @@ std::string serializeAssets(const std::vector<AssetConfig>& assets) {
     return out.str();
 }
 
-std::string serializeRoom(const GameRoom& room) {
+std::string serializeRoom(const GameRoom& room, bool includeAssets = true) {
     std::ostringstream out;
     out << "{"
         << "\"id\":\"" << jsonEscape(room.id) << "\","
@@ -811,13 +1252,16 @@ std::string serializeRoom(const GameRoom& room) {
         << "\"difficulty\":\"" << jsonEscape(room.difficulty) << "\","
         << "\"startingCash\":" << room.startingCash << ","
         << "\"maxParticipants\":" << room.maxParticipants << ","
+        << "\"startDelaySeconds\":" << room.startDelaySeconds << ","
+        << "\"gameDurationSeconds\":" << room.gameDurationSeconds << ","
+        << "\"rejoinCooldownSeconds\":" << room.rejoinCooldownSeconds << ","
         << "\"houseLiquidity\":" << (room.houseLiquidity ? "true" : "false") << ","
-        << "\"assets\":" << serializeAssets(room.assets)
+        << "\"assets\":" << (includeAssets ? serializeAssets(room.assets) : "[]")
         << "}";
     return out.str();
 }
 
-std::string serializeRooms(const std::vector<const GameRoom*>& rooms) {
+std::string serializeRooms(const std::vector<const GameRoom*>& rooms, bool includeAssets = true) {
     std::ostringstream out;
     out << "{\"rooms\":[";
 
@@ -826,7 +1270,7 @@ std::string serializeRooms(const std::vector<const GameRoom*>& rooms) {
             out << ",";
         }
 
-        out << serializeRoom(*rooms[i]);
+        out << serializeRoom(*rooms[i], includeAssets);
     }
 
     out << "]}";
@@ -837,16 +1281,29 @@ std::string serializeLobby(const CompetitiveLobby& lobby) {
     const std::size_t participantCount = lobby.participantCount();
     const std::size_t capacity = static_cast<std::size_t>(lobby.capacity);
     const std::size_t spotsRemaining = capacity > participantCount ? capacity - participantCount : 0;
+    const LobbyPhase phase = lobby.currentPhase();
+    const std::optional<TimePoint> startsAt = lobby.currentStartsAt();
+    const std::optional<TimePoint> endsAt = lobby.currentEndsAt();
+    const bool acceptingJoins = phase == LobbyPhase::Waiting || phase == LobbyPhase::Starting;
+    const std::string status = !acceptingJoins ? "closed" : (spotsRemaining == 0 ? "full" : "open");
 
     std::ostringstream out;
     out << "{"
         << "\"id\":\"" << jsonEscape(lobby.id) << "\","
         << "\"name\":\"" << jsonEscape(lobby.name) << "\","
         << "\"roomId\":\"" << jsonEscape(lobby.roomId) << "\","
-        << "\"status\":\"" << (spotsRemaining == 0 ? "full" : "open") << "\","
+        << "\"status\":\"" << status << "\","
+        << "\"phase\":\"" << lobbyPhaseToString(phase) << "\","
         << "\"participantCount\":" << participantCount << ","
         << "\"capacity\":" << lobby.capacity << ","
-        << "\"spotsRemaining\":" << spotsRemaining
+        << "\"spotsRemaining\":" << (acceptingJoins ? spotsRemaining : 0) << ","
+        << "\"minStartParticipants\":" << lobby.minStartParticipants() << ","
+        << "\"startDelaySeconds\":" << lobby.startDelaySeconds << ","
+        << "\"gameDurationSeconds\":" << lobby.gameDurationSeconds << ","
+        << "\"startsAt\":" << (startsAt ? std::to_string(epochSeconds(*startsAt)) : "null") << ","
+        << "\"endsAt\":" << (endsAt ? std::to_string(epochSeconds(*endsAt)) : "null") << ","
+        << "\"startsInSeconds\":" << lobby.startsInSeconds() << ","
+        << "\"endsInSeconds\":" << lobby.endsInSeconds()
         << "}";
     return out.str();
 }
@@ -944,6 +1401,56 @@ std::vector<SymbolOpenOrder> collectOpenOrders(const Exchange& exchange, TraderI
         return left.order.orderId < right.order.orderId;
     });
     return result;
+}
+
+std::int64_t reservedBuyCashForTrader(
+    const Exchange& exchange,
+    TraderId traderId,
+    std::optional<OrderId> excludeOrderId = std::nullopt) {
+    std::int64_t reserved = 0;
+    for (const SymbolOpenOrder& item : collectOpenOrders(exchange, traderId)) {
+        if (excludeOrderId && item.order.orderId == *excludeOrderId) {
+            continue;
+        }
+
+        if (item.order.side == Side::Buy) {
+            reserved += item.order.price * item.order.remainingQuantity;
+        }
+    }
+
+    return reserved;
+}
+
+Qty reservedOpenSellQuantityForTrader(
+    const Exchange& exchange,
+    TraderId traderId,
+    const std::string& symbol,
+    std::optional<OrderId> excludeOrderId = std::nullopt) {
+    Qty reserved = 0;
+    for (const OpenOrder& order : exchange.openOrders(symbol, traderId)) {
+        if (excludeOrderId && order.orderId == *excludeOrderId) {
+            continue;
+        }
+
+        if (order.side == Side::Sell) {
+            reserved += order.remainingQuantity;
+        }
+    }
+
+    return reserved;
+}
+
+std::int64_t CompetitiveLobby::reservedCashForTrader(const GameRoom& room, TraderId traderId) {
+    return reservedBuyCashForTrader(room.exchange, traderId);
+}
+
+Qty CompetitiveLobby::reservedSellQuantityForTrader(const GameRoom& room, TraderId traderId) {
+    Qty total = 0;
+    for (const std::string& symbol : room.exchange.symbols()) {
+        total += reservedOpenSellQuantityForTrader(room.exchange, traderId, symbol);
+    }
+
+    return total;
 }
 
 std::string serializeOpenOrders(const std::vector<SymbolOpenOrder>& orders) {
@@ -1046,6 +1553,10 @@ std::string serializePortfolio(const PortfolioRecord& portfolio) {
         << "\"traderId\":" << portfolio.traderId << ","
         << "\"startingCash\":" << portfolio.startingCash << ","
         << "\"cashFlow\":" << portfolio.cashFlow << ","
+        << "\"cash\":" << portfolio.cash << ","
+        << "\"reservedCash\":" << portfolio.reservedCash << ","
+        << "\"availableCash\":" << portfolio.availableCash << ","
+        << "\"reservedLongQuantity\":" << portfolio.reservedLongQuantity << ","
         << "\"marketValue\":" << jsonDouble(portfolio.marketValue) << ","
         << "\"estimatedValue\":" << jsonDouble(portfolio.estimatedValue) << ","
         << "\"tradingPnl\":" << jsonDouble(portfolio.tradingPnl) << ","
@@ -1076,6 +1587,86 @@ std::string serializeMe(
         << "\"fillCount\":" << fills.size() << ","
         << "\"positionCount\":" << positions.size()
         << "}";
+    return out.str();
+}
+
+std::string serializeLeaderboard(const std::vector<LeaderboardRow>& rows) {
+    std::ostringstream out;
+    out << "{\"leaderboard\":[";
+
+    for (std::size_t i = 0; i < rows.size(); ++i) {
+        if (i > 0) {
+            out << ",";
+        }
+
+        const LeaderboardRow& row = rows[i];
+        out << "{"
+            << "\"rank\":" << (i + 1) << ","
+            << "\"traderId\":" << row.traderId << ","
+            << "\"track\":\"" << participantTrackToString(row.track) << "\","
+            << "\"pnl\":" << jsonDouble(row.pnl) << ","
+            << "\"estimatedValue\":" << jsonDouble(row.estimatedValue) << ","
+            << "\"ratingBefore\":" << row.ratingBefore << ","
+            << "\"ratingAfter\":" << row.ratingAfter
+            << "}";
+    }
+
+    out << "]}";
+    return out.str();
+}
+
+std::string serializeActiveSession(const std::optional<ActiveSession>& session) {
+    if (!session) {
+        return "null";
+    }
+
+    std::ostringstream out;
+    out << "{"
+        << "\"id\":\"" << jsonEscape(session->id) << "\","
+        << "\"roomId\":\"" << jsonEscape(session->roomId) << "\","
+        << "\"competitive\":" << (session->competitive ? "true" : "false")
+        << "}";
+    return out.str();
+}
+
+std::string joinResultMessage(LobbyJoinResult result) {
+    switch (result) {
+        case LobbyJoinResult::Joined:
+            return "joined";
+        case LobbyJoinResult::AlreadyJoined:
+            return "already joined";
+        case LobbyJoinResult::Full:
+            return "lobby is full";
+        case LobbyJoinResult::ActiveElsewhere:
+            return "leave your current lobby before joining another";
+        case LobbyJoinResult::CoolingDown:
+            return "wait for the rejoin cooldown";
+        case LobbyJoinResult::GameClosed:
+            return "this game is closed";
+    }
+
+    return "join failed";
+}
+
+std::string serializeJoinOutcome(
+    const LobbyJoinOutcome& outcome,
+    TraderId traderId,
+    const std::optional<ActiveSession>& activeSession,
+    const std::string& targetJson) {
+    std::ostringstream out;
+    const bool joined = outcome.result == LobbyJoinResult::Joined || outcome.result == LobbyJoinResult::AlreadyJoined;
+    out << "{"
+        << "\"joined\":" << (joined ? "true" : "false") << ","
+        << "\"alreadyJoined\":" << (outcome.result == LobbyJoinResult::AlreadyJoined ? "true" : "false") << ","
+        << "\"traderId\":" << traderId << ","
+        << "\"message\":\"" << jsonEscape(joinResultMessage(outcome.result)) << "\","
+        << "\"cooldownRemainingSeconds\":" << outcome.cooldownRemainingSeconds << ","
+        << "\"activeSession\":" << serializeActiveSession(activeSession);
+    if (!targetJson.empty()) {
+        out << "," << targetJson;
+    }
+
+    out << "}";
     return out.str();
 }
 
@@ -1192,7 +1783,12 @@ TraderId traderIdFromSubject(const std::string& subject) {
     return static_cast<TraderId>((hash % 9'000'000'000ULL) + 1);
 }
 
-TraderId authenticatedTraderId(const HttpRequest& request) {
+struct AuthenticatedUser {
+    TraderId traderId = 0;
+    std::string subject;
+};
+
+AuthenticatedUser authenticatedUser(const HttpRequest& request) {
     const std::optional<std::string> token = bearerToken(request);
     if (!token) {
         throw AuthError("missing Authorization bearer token");
@@ -1203,8 +1799,336 @@ TraderId authenticatedTraderId(const HttpRequest& request) {
         throw AuthError("bearer token must be a Clerk JWT with a sub claim");
     }
 
-    return traderIdFromSubject(*subject);
+    return {traderIdFromSubject(*subject), *subject};
 }
+
+TraderId authenticatedTraderId(const HttpRequest& request) {
+    return authenticatedUser(request).traderId;
+}
+
+class PersistenceStore {
+public:
+    PersistenceStore() {
+#ifdef ORDERBOOK_WITH_POSTGRES
+        const char* databaseUrl = std::getenv("DATABASE_URL");
+        if (databaseUrl == nullptr || databaseUrl[0] == '\0') {
+            return;
+        }
+
+        connection = PQconnectdb(databaseUrl);
+        if (PQstatus(connection) != CONNECTION_OK) {
+            std::cerr << "PostgreSQL disabled: " << PQerrorMessage(connection) << "\n";
+            PQfinish(connection);
+            connection = nullptr;
+            return;
+        }
+
+        ensureSchema();
+        std::cout << "PostgreSQL persistence enabled.\n";
+#endif
+    }
+
+    ~PersistenceStore() {
+#ifdef ORDERBOOK_WITH_POSTGRES
+        if (connection != nullptr) {
+            PQfinish(connection);
+        }
+#endif
+    }
+
+    bool enabled() const {
+#ifdef ORDERBOOK_WITH_POSTGRES
+        return connection != nullptr;
+#else
+        return false;
+#endif
+    }
+
+    std::unordered_map<TraderId, int> loadRatings(ParticipantTrack track) const {
+        (void)track;
+        std::unordered_map<TraderId, int> result;
+#ifdef ORDERBOOK_WITH_POSTGRES
+        if (connection == nullptr) {
+            return result;
+        }
+
+        const char* column = track == ParticipantTrack::Bot ? "bot_elo" : "manual_elo";
+        const std::string sql = std::string("SELECT trader_id, ") + column + " FROM orderbook_users";
+        PGresult* query = PQexec(connection, sql.c_str());
+        if (PQresultStatus(query) != PGRES_TUPLES_OK) {
+            std::cerr << "PostgreSQL rating load failed: " << PQerrorMessage(connection) << "\n";
+            PQclear(query);
+            return result;
+        }
+
+        const int rows = PQntuples(query);
+        for (int row = 0; row < rows; ++row) {
+            result[std::stoll(PQgetvalue(query, row, 0))] = std::stoi(PQgetvalue(query, row, 1));
+        }
+
+        PQclear(query);
+#endif
+        return result;
+    }
+
+    void upsertUser(const AuthenticatedUser& user) {
+        execParams(
+            "INSERT INTO orderbook_users (trader_id, clerk_subject) VALUES ($1, $2) "
+            "ON CONFLICT (trader_id) DO UPDATE SET clerk_subject = EXCLUDED.clerk_subject, updated_at = now()",
+            {std::to_string(user.traderId), user.subject});
+    }
+
+    void recordSessionEvent(
+        const std::string& sessionId,
+        const std::string& roomId,
+        RoomMode mode,
+        TraderId traderId,
+        ParticipantTrack track,
+        const std::string& eventType,
+        std::optional<TimePoint> cooldownUntil = std::nullopt) {
+        execParams(
+            "INSERT INTO orderbook_session_events "
+            "(session_id, room_id, mode, trader_id, track, event_type, cooldown_until_epoch) "
+            "VALUES ($1, $2, $3, $4, $5, $6, $7)",
+            {
+                sessionId,
+                roomId,
+                roomModeToString(mode),
+                std::to_string(traderId),
+                participantTrackToString(track),
+                eventType,
+                cooldownUntil ? std::to_string(epochSeconds(*cooldownUntil)) : "",
+            });
+    }
+
+    void recordOrder(
+        const std::string& sessionId,
+        TraderId traderId,
+        Side side,
+        const std::string& mode,
+        const ParsedOrder& order,
+        const SubmitResult& result) {
+        execParams(
+            "INSERT INTO orderbook_orders "
+            "(session_id, trader_id, order_id, symbol, side, mode, price, quantity, accepted, "
+            "filled_quantity, resting_quantity, notional, message) "
+            "VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)",
+            {
+                sessionId,
+                std::to_string(traderId),
+                std::to_string(order.orderId),
+                order.symbol,
+                sideToString(side),
+                mode,
+                std::to_string(order.price),
+                std::to_string(order.quantity),
+                result.accepted ? "true" : "false",
+                std::to_string(result.filledQuantity),
+                std::to_string(result.restingQuantity),
+                std::to_string(result.notional),
+                result.message,
+            });
+    }
+
+    void recordCancel(
+        const std::string& sessionId,
+        TraderId traderId,
+        const std::string& symbol,
+        OrderId orderId,
+        bool canceled) {
+        execParams(
+            "INSERT INTO orderbook_cancels "
+            "(session_id, trader_id, symbol, order_id, canceled) "
+            "VALUES ($1, $2, $3, $4, $5)",
+            {
+                sessionId,
+                std::to_string(traderId),
+                symbol,
+                std::to_string(orderId),
+                canceled ? "true" : "false",
+            });
+    }
+
+    void recordTrades(const std::string& sessionId, const std::string& symbol, const SubmitResult& result) {
+        for (const Trade& trade : result.trades) {
+            execParams(
+                "INSERT INTO orderbook_market_trades "
+                "(session_id, symbol, taker_order_id, maker_order_id, taker_trader_id, maker_trader_id, "
+                "taker_side, price, quantity, notional) "
+                "VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+                {
+                    sessionId,
+                    symbol,
+                    std::to_string(trade.takerId),
+                    std::to_string(trade.makerId),
+                    std::to_string(trade.takerTraderId),
+                    std::to_string(trade.makerTraderId),
+                    sideToString(trade.takerSide),
+                    std::to_string(trade.price),
+                    std::to_string(trade.quantity),
+                    std::to_string(trade.price * trade.quantity),
+                });
+        }
+    }
+
+    void recordRating(const std::string& lobbyId, const LeaderboardRow& row) {
+        execParams(
+            "INSERT INTO orderbook_ratings "
+            "(lobby_id, trader_id, track, pnl, estimated_value, rating_before, rating_after) "
+            "VALUES ($1, $2, $3, $4, $5, $6, $7)",
+            {
+                lobbyId,
+                std::to_string(row.traderId),
+                participantTrackToString(row.track),
+                jsonDouble(row.pnl),
+                jsonDouble(row.estimatedValue),
+                std::to_string(row.ratingBefore),
+                std::to_string(row.ratingAfter),
+            });
+
+        const std::string column = row.track == ParticipantTrack::Bot ? "bot_elo" : "manual_elo";
+        execParams(
+            "UPDATE orderbook_users SET " + column + " = $1, updated_at = now() WHERE trader_id = $2",
+            {std::to_string(row.ratingAfter), std::to_string(row.traderId)});
+    }
+
+private:
+    void ensureSchema() {
+#ifdef ORDERBOOK_WITH_POSTGRES
+        exec(
+            "CREATE TABLE IF NOT EXISTS orderbook_users ("
+            "trader_id BIGINT PRIMARY KEY,"
+            "clerk_subject TEXT UNIQUE NOT NULL,"
+            "manual_elo INTEGER NOT NULL DEFAULT 1200,"
+            "bot_elo INTEGER NOT NULL DEFAULT 1200,"
+            "created_at TIMESTAMPTZ NOT NULL DEFAULT now(),"
+            "updated_at TIMESTAMPTZ NOT NULL DEFAULT now()"
+            ");"
+            "CREATE TABLE IF NOT EXISTS orderbook_session_events ("
+            "id BIGSERIAL PRIMARY KEY,"
+            "session_id TEXT NOT NULL,"
+            "room_id TEXT NOT NULL,"
+            "mode TEXT NOT NULL,"
+            "trader_id BIGINT NOT NULL,"
+            "track TEXT NOT NULL,"
+            "event_type TEXT NOT NULL,"
+            "cooldown_until_epoch BIGINT,"
+            "created_at TIMESTAMPTZ NOT NULL DEFAULT now()"
+            ");"
+            "CREATE TABLE IF NOT EXISTS orderbook_orders ("
+            "id BIGSERIAL PRIMARY KEY,"
+            "session_id TEXT NOT NULL,"
+            "trader_id BIGINT NOT NULL,"
+            "order_id BIGINT NOT NULL,"
+            "symbol TEXT NOT NULL,"
+            "side TEXT NOT NULL,"
+            "mode TEXT NOT NULL,"
+            "price BIGINT NOT NULL,"
+            "quantity BIGINT NOT NULL,"
+            "accepted BOOLEAN NOT NULL,"
+            "filled_quantity BIGINT NOT NULL,"
+            "resting_quantity BIGINT NOT NULL,"
+            "notional BIGINT NOT NULL,"
+            "message TEXT NOT NULL,"
+            "created_at TIMESTAMPTZ NOT NULL DEFAULT now()"
+            ");"
+            "CREATE INDEX IF NOT EXISTS orderbook_orders_session_trader_idx "
+            "ON orderbook_orders(session_id, trader_id);"
+            "CREATE TABLE IF NOT EXISTS orderbook_cancels ("
+            "id BIGSERIAL PRIMARY KEY,"
+            "session_id TEXT NOT NULL,"
+            "trader_id BIGINT NOT NULL,"
+            "symbol TEXT NOT NULL,"
+            "order_id BIGINT NOT NULL,"
+            "canceled BOOLEAN NOT NULL,"
+            "created_at TIMESTAMPTZ NOT NULL DEFAULT now()"
+            ");"
+            "CREATE INDEX IF NOT EXISTS orderbook_cancels_session_trader_idx "
+            "ON orderbook_cancels(session_id, trader_id);"
+            "CREATE TABLE IF NOT EXISTS orderbook_market_trades ("
+            "id BIGSERIAL PRIMARY KEY,"
+            "session_id TEXT NOT NULL,"
+            "symbol TEXT NOT NULL,"
+            "taker_order_id BIGINT NOT NULL,"
+            "maker_order_id BIGINT NOT NULL,"
+            "taker_trader_id BIGINT NOT NULL,"
+            "maker_trader_id BIGINT NOT NULL,"
+            "taker_side TEXT NOT NULL,"
+            "price BIGINT NOT NULL,"
+            "quantity BIGINT NOT NULL,"
+            "notional BIGINT NOT NULL,"
+            "created_at TIMESTAMPTZ NOT NULL DEFAULT now()"
+            ");"
+            "CREATE INDEX IF NOT EXISTS orderbook_trades_session_symbol_idx "
+            "ON orderbook_market_trades(session_id, symbol);"
+            "CREATE TABLE IF NOT EXISTS orderbook_ratings ("
+            "id BIGSERIAL PRIMARY KEY,"
+            "lobby_id TEXT NOT NULL,"
+            "trader_id BIGINT NOT NULL,"
+            "track TEXT NOT NULL,"
+            "pnl DOUBLE PRECISION NOT NULL,"
+            "estimated_value DOUBLE PRECISION NOT NULL,"
+            "rating_before INTEGER NOT NULL,"
+            "rating_after INTEGER NOT NULL,"
+            "created_at TIMESTAMPTZ NOT NULL DEFAULT now()"
+            ");");
+#endif
+    }
+
+    void exec(const std::string& sql) {
+#ifdef ORDERBOOK_WITH_POSTGRES
+        if (connection == nullptr) {
+            return;
+        }
+
+        PGresult* result = PQexec(connection, sql.c_str());
+        const ExecStatusType status = PQresultStatus(result);
+        if (status != PGRES_COMMAND_OK && status != PGRES_TUPLES_OK) {
+            std::cerr << "PostgreSQL query failed: " << PQerrorMessage(connection) << "\n";
+        }
+
+        PQclear(result);
+#else
+        (void)sql;
+#endif
+    }
+
+    void execParams(const std::string& sql, const std::vector<std::string>& params) const {
+#ifdef ORDERBOOK_WITH_POSTGRES
+        if (connection == nullptr) {
+            return;
+        }
+
+        std::vector<const char*> values;
+        values.reserve(params.size());
+        for (const std::string& param : params) {
+            values.push_back(param.empty() ? nullptr : param.c_str());
+        }
+
+        PGresult* result = PQexecParams(
+            connection,
+            sql.c_str(),
+            static_cast<int>(values.size()),
+            nullptr,
+            values.data(),
+            nullptr,
+            nullptr,
+            0);
+        if (PQresultStatus(result) != PGRES_COMMAND_OK) {
+            std::cerr << "PostgreSQL write failed: " << PQerrorMessage(connection) << "\n";
+        }
+
+        PQclear(result);
+#else
+        (void)sql;
+        (void)params;
+#endif
+    }
+
+#ifdef ORDERBOOK_WITH_POSTGRES
+    PGconn* connection = nullptr;
+#endif
+};
 
 void rejectClientOrderId(const std::string& body) {
     if (jsonIntField(body, "orderId")) {
@@ -1380,17 +2304,110 @@ HttpResponse jsonResponse(int status, const std::string& body) {
     return {status, "application/json", body};
 }
 
-HttpResponse orderResultResponse(AccountStore& accounts, const std::string& symbol, const SubmitResult& result) {
+bool hasSymbol(const Exchange& exchange, const std::string& symbol) {
+    const std::vector<std::string> symbols = exchange.symbols();
+    return std::find(symbols.begin(), symbols.end(), symbol) != symbols.end();
+}
+
+std::optional<std::int64_t> marketBuyNotionalEstimate(const Exchange& exchange, const std::string& symbol, Qty quantity) {
+    BookSnapshot snapshot = exchange.snapshot(symbol, std::numeric_limits<std::size_t>::max());
+    Qty remaining = quantity;
+    std::int64_t notional = 0;
+
+    for (const BookLevel& ask : snapshot.asks) {
+        if (remaining <= 0) {
+            break;
+        }
+
+        const Qty tradeQuantity = std::min(remaining, ask.quantity);
+        remaining -= tradeQuantity;
+        notional += ask.price * tradeQuantity;
+    }
+
+    if (remaining > 0) {
+        return std::nullopt;
+    }
+
+    return notional;
+}
+
+void ensureRiskAllowed(
+    const GameRoom& room,
+    TraderId traderId,
+    Side side,
+    const ParsedOrder& order,
+    bool market,
+    std::optional<OrderId> replacedOrderId = std::nullopt) {
+    if (!hasSymbol(room.exchange, order.symbol)) {
+        throw std::runtime_error("symbol is not allowed in this room");
+    }
+
+    if (side == Side::Buy) {
+        const std::int64_t requiredCash = market
+            ? marketBuyNotionalEstimate(room.exchange, order.symbol, order.quantity).value_or(-1)
+            : order.price * order.quantity;
+        if (requiredCash < 0) {
+            throw std::runtime_error("not enough sell liquidity to estimate this market buy");
+        }
+
+        const std::int64_t cash = room.startingCash + room.accounts.cashFlowForTrader(traderId);
+        const std::int64_t reservedCash = reservedBuyCashForTrader(room.exchange, traderId, replacedOrderId);
+        const std::int64_t availableCash = cash - reservedCash;
+        if (requiredCash > availableCash) {
+            throw std::runtime_error(
+                "not enough cash: available " + std::to_string(availableCash)
+                + ", required " + std::to_string(requiredCash));
+        }
+
+        return;
+    }
+
+    const Qty ownedQuantity = room.accounts.positionQuantityForTrader(traderId, order.symbol);
+    const Qty reservedQuantity = reservedOpenSellQuantityForTrader(room.exchange, traderId, order.symbol, replacedOrderId);
+    const Qty availableQuantity = ownedQuantity - reservedQuantity;
+    if (order.quantity > availableQuantity) {
+        throw std::runtime_error(
+            "not enough position: available " + std::to_string(availableQuantity)
+            + ", required " + std::to_string(order.quantity));
+    }
+}
+
+PortfolioRecord portfolioWithReservations(const GameRoom& room, TraderId traderId) {
+    Qty reservedSellQuantity = 0;
+    for (const std::string& symbol : room.exchange.symbols()) {
+        reservedSellQuantity += reservedOpenSellQuantityForTrader(room.exchange, traderId, symbol);
+    }
+
+    return room.accounts.portfolioForTrader(
+        traderId,
+        room.startingCash,
+        reservedBuyCashForTrader(room.exchange, traderId),
+        reservedSellQuantity);
+}
+
+HttpResponse orderResultResponse(
+    AccountStore& accounts,
+    PersistenceStore& persistence,
+    const std::string& sessionId,
+    const std::string& symbol,
+    const ParsedOrder& order,
+    TraderId traderId,
+    Side side,
+    const std::string& mode,
+    const SubmitResult& result) {
     accounts.recordTrades(symbol, result);
+    persistence.recordOrder(sessionId, traderId, side, mode, order, result);
+    persistence.recordTrades(sessionId, symbol, result);
     return jsonResponse(200, serializeSubmitResult(result));
 }
 
 HttpResponse handleGetMe(
-    Exchange& exchange,
-    AccountStore& accounts,
-    std::int64_t startingCash,
+    GameRoom& room,
     const std::string& path,
     const HttpRequest& request) {
+    Exchange& exchange = room.exchange;
+    AccountStore& accounts = room.accounts;
+
     try {
         const TraderId traderId = authenticatedTraderId(request);
 
@@ -1414,7 +2431,7 @@ HttpResponse handleGetMe(
         }
 
         if (path == "/me/portfolio") {
-            return jsonResponse(200, serializePortfolio(accounts.portfolioForTrader(traderId, startingCash)));
+            return jsonResponse(200, serializePortfolio(portfolioWithReservations(room, traderId)));
         }
     } catch (const AuthError& ex) {
         return jsonResponse(401, jsonError(ex.what()));
@@ -1426,80 +2443,174 @@ HttpResponse handleGetMe(
 }
 
 HttpResponse handlePostOrder(
-    Exchange& exchange,
-    AccountStore& accounts,
-    OrderIdGenerator& orderIds,
+    GameRoom& room,
+    PersistenceStore& persistence,
+    const std::string& sessionId,
     const std::string& path,
     const HttpRequest& request) {
+    Exchange& exchange = room.exchange;
+    AccountStore& accounts = room.accounts;
+    OrderIdGenerator& orderIds = room.orderIds;
+
     try {
         const TraderId traderId = authenticatedTraderId(request);
         const std::string& body = request.body;
 
         if (path == "/orders/buy") {
             ParsedOrder order = parseNewOrderWithPrice(body);
+            ensureRiskAllowed(room, traderId, Side::Buy, order, false);
             order.orderId = orderIds.next();
-            return orderResultResponse(accounts, order.symbol,
+            return orderResultResponse(
+                accounts,
+                persistence,
+                sessionId,
+                order.symbol,
+                order,
+                traderId,
+                Side::Buy,
+                "limit",
                 exchange.buy(order.symbol, traderId, order.orderId, order.price, order.quantity));
         }
 
         if (path == "/orders/sell") {
             ParsedOrder order = parseNewOrderWithPrice(body);
+            ensureRiskAllowed(room, traderId, Side::Sell, order, false);
             order.orderId = orderIds.next();
-            return orderResultResponse(accounts, order.symbol,
+            return orderResultResponse(
+                accounts,
+                persistence,
+                sessionId,
+                order.symbol,
+                order,
+                traderId,
+                Side::Sell,
+                "limit",
                 exchange.sell(order.symbol, traderId, order.orderId, order.price, order.quantity));
         }
 
         if (path == "/orders/market-buy") {
             ParsedOrder order = parseNewMarketOrder(body);
+            ensureRiskAllowed(room, traderId, Side::Buy, order, true);
             order.orderId = orderIds.next();
-            return orderResultResponse(accounts, order.symbol,
+            return orderResultResponse(
+                accounts,
+                persistence,
+                sessionId,
+                order.symbol,
+                order,
+                traderId,
+                Side::Buy,
+                "market",
                 exchange.marketBuy(order.symbol, traderId, order.orderId, order.quantity));
         }
 
         if (path == "/orders/market-sell") {
             ParsedOrder order = parseNewMarketOrder(body);
+            ensureRiskAllowed(room, traderId, Side::Sell, order, true);
             order.orderId = orderIds.next();
-            return orderResultResponse(accounts, order.symbol,
+            return orderResultResponse(
+                accounts,
+                persistence,
+                sessionId,
+                order.symbol,
+                order,
+                traderId,
+                Side::Sell,
+                "market",
                 exchange.marketSell(order.symbol, traderId, order.orderId, order.quantity));
         }
 
         if (path == "/orders/ioc-buy") {
             ParsedOrder order = parseNewOrderWithPrice(body);
+            ensureRiskAllowed(room, traderId, Side::Buy, order, false);
             order.orderId = orderIds.next();
-            return orderResultResponse(accounts, order.symbol,
+            return orderResultResponse(
+                accounts,
+                persistence,
+                sessionId,
+                order.symbol,
+                order,
+                traderId,
+                Side::Buy,
+                "ioc",
                 exchange.iocBuy(order.symbol, traderId, order.orderId, order.price, order.quantity));
         }
 
         if (path == "/orders/ioc-sell") {
             ParsedOrder order = parseNewOrderWithPrice(body);
+            ensureRiskAllowed(room, traderId, Side::Sell, order, false);
             order.orderId = orderIds.next();
-            return orderResultResponse(accounts, order.symbol,
+            return orderResultResponse(
+                accounts,
+                persistence,
+                sessionId,
+                order.symbol,
+                order,
+                traderId,
+                Side::Sell,
+                "ioc",
                 exchange.iocSell(order.symbol, traderId, order.orderId, order.price, order.quantity));
         }
 
         if (path == "/orders/fok-buy") {
             ParsedOrder order = parseNewOrderWithPrice(body);
+            ensureRiskAllowed(room, traderId, Side::Buy, order, false);
             order.orderId = orderIds.next();
-            return orderResultResponse(accounts, order.symbol,
+            return orderResultResponse(
+                accounts,
+                persistence,
+                sessionId,
+                order.symbol,
+                order,
+                traderId,
+                Side::Buy,
+                "fok",
                 exchange.fokBuy(order.symbol, traderId, order.orderId, order.price, order.quantity));
         }
 
         if (path == "/orders/fok-sell") {
             ParsedOrder order = parseNewOrderWithPrice(body);
+            ensureRiskAllowed(room, traderId, Side::Sell, order, false);
             order.orderId = orderIds.next();
-            return orderResultResponse(accounts, order.symbol,
+            return orderResultResponse(
+                accounts,
+                persistence,
+                sessionId,
+                order.symbol,
+                order,
+                traderId,
+                Side::Sell,
+                "fok",
                 exchange.fokSell(order.symbol, traderId, order.orderId, order.price, order.quantity));
         }
 
         if (path == "/orders/replace-buy") {
             const ParsedOrder order = parseOrderWithPrice(body);
-            return orderResultResponse(accounts, order.symbol,
+            ensureRiskAllowed(room, traderId, Side::Buy, order, false, order.orderId);
+            return orderResultResponse(
+                accounts,
+                persistence,
+                sessionId,
+                order.symbol,
+                order,
+                traderId,
+                Side::Buy,
+                "replace",
                 exchange.replaceBuy(order.symbol, traderId, order.orderId, order.price, order.quantity));
         }
 
         if (path == "/orders/replace-sell") {
             const ParsedOrder order = parseOrderWithPrice(body);
-            return orderResultResponse(accounts, order.symbol,
+            ensureRiskAllowed(room, traderId, Side::Sell, order, false, order.orderId);
+            return orderResultResponse(
+                accounts,
+                persistence,
+                sessionId,
+                order.symbol,
+                order,
+                traderId,
+                Side::Sell,
+                "replace",
                 exchange.replaceSell(order.symbol, traderId, order.orderId, order.price, order.quantity));
         }
 
@@ -1512,6 +2623,7 @@ HttpResponse handlePostOrder(
             }
 
             const bool canceled = exchange.cancelForTrader(*symbol, traderId, *orderId);
+            persistence.recordCancel(sessionId, traderId, *symbol, *orderId, canceled);
             return jsonResponse(200, std::string("{\"canceled\":") + (canceled ? "true" : "false") + "}");
         }
     } catch (const AuthError& ex) {
@@ -1523,11 +2635,14 @@ HttpResponse handlePostOrder(
     return jsonResponse(404, jsonError("unknown POST endpoint"));
 }
 
-HttpResponse routeRoom(GameRoom& room, const HttpRequest& request) {
+HttpResponse routeRoom(
+    GameRoom& room,
+    PersistenceStore& persistence,
+    const std::string& sessionId,
+    const HttpRequest& request) {
     const auto [path, query] = splitQuery(request.path);
     Exchange& exchange = room.exchange;
     AccountStore& accounts = room.accounts;
-    OrderIdGenerator& orderIds = room.orderIds;
 
     if (request.method == "OPTIONS") {
         return jsonResponse(200, "{}");
@@ -1563,14 +2678,14 @@ HttpResponse routeRoom(GameRoom& room, const HttpRequest& request) {
 
         if (path == "/me" || path == "/me/orders" || path == "/me/fills" || path == "/me/trades"
             || path == "/me/positions" || path == "/me/portfolio") {
-            return handleGetMe(exchange, accounts, room.startingCash, path, request);
+            return handleGetMe(room, path, request);
         }
 
         return jsonResponse(404, jsonError("unknown GET endpoint"));
     }
 
     if (request.method == "POST") {
-        return handlePostOrder(exchange, accounts, orderIds, path, request);
+        return handlePostOrder(room, persistence, sessionId, path, request);
     }
 
     return jsonResponse(405, jsonError("only GET, POST, and OPTIONS are supported"));
@@ -1585,7 +2700,11 @@ void cancelTraderOrders(Exchange& exchange, TraderId traderId) {
     }
 }
 
-HttpResponse routeLobby(CompetitiveLobby& lobby, const HttpRequest& request) {
+HttpResponse routeLobby(
+    RoomStore& rooms,
+    CompetitiveLobby& lobby,
+    PersistenceStore& persistence,
+    const HttpRequest& request) {
     const auto [path, query] = splitQuery(request.path);
 
     if (request.method == "OPTIONS") {
@@ -1594,47 +2713,91 @@ HttpResponse routeLobby(CompetitiveLobby& lobby, const HttpRequest& request) {
 
     try {
         if (request.method == "GET" && path == "/membership") {
-            const TraderId traderId = authenticatedTraderId(request);
+            const AuthenticatedUser user = authenticatedUser(request);
+            persistence.upsertUser(user);
+            const std::optional<LobbyMembershipRecord> membership = lobby.membershipFor(user.traderId);
             return jsonResponse(
                 200,
-                std::string("{\"joined\":") + (lobby.contains(traderId) ? "true" : "false")
-                    + ",\"traderId\":" + std::to_string(traderId) + "}");
+                std::string("{\"joined\":")
+                    + (membership && rooms.hasActiveSession(user.traderId, lobby.id) ? "true" : "false")
+                    + ",\"traderId\":" + std::to_string(user.traderId)
+                    + ",\"track\":\"" + participantTrackToString(membership ? membership->track : ParticipantTrack::Manual) + "\""
+                    + ",\"cooldownRemainingSeconds\":" + std::to_string(rooms.cooldownRemainingSeconds(user.traderId))
+                    + ",\"activeSession\":" + serializeActiveSession(rooms.activeSessionFor(user.traderId))
+                    + ",\"lobby\":" + serializeLobby(lobby)
+                    + "}");
         }
 
         if (request.method == "POST" && path == "/join") {
-            const TraderId traderId = authenticatedTraderId(request);
-            const LobbyJoinResult result = lobby.join(traderId);
-            if (result == LobbyJoinResult::Full) {
-                return jsonResponse(409, jsonError("lobby is full"));
+            const AuthenticatedUser user = authenticatedUser(request);
+            persistence.upsertUser(user);
+            const ParticipantTrack track = parseParticipantTrack(jsonStringField(request.body, "track").value_or("manual"));
+            const LobbyJoinOutcome outcome = rooms.joinCompetitiveLobby(lobby.id, user.traderId, track);
+            if (outcome.result == LobbyJoinResult::Joined) {
+                persistence.recordSessionEvent(lobby.id, lobby.roomId, RoomMode::Competitive, user.traderId, track, "join");
             }
 
+            const int status = (outcome.result == LobbyJoinResult::Joined || outcome.result == LobbyJoinResult::AlreadyJoined)
+                ? 200
+                : 409;
             return jsonResponse(
-                200,
-                std::string("{\"joined\":true,\"alreadyJoined\":")
-                    + (result == LobbyJoinResult::AlreadyJoined ? "true" : "false")
-                    + ",\"lobby\":" + serializeLobby(lobby) + "}");
+                status,
+                serializeJoinOutcome(outcome, user.traderId, rooms.activeSessionFor(user.traderId), "\"lobby\":" + serializeLobby(lobby)));
         }
 
         if (request.method == "POST" && path == "/leave") {
-            const TraderId traderId = authenticatedTraderId(request);
-            const bool left = lobby.leave(traderId);
+            const AuthenticatedUser user = authenticatedUser(request);
+            persistence.upsertUser(user);
+            const std::optional<LobbyMembershipRecord> membership = lobby.membershipFor(user.traderId);
+            const ParticipantTrack track = membership ? membership->track : ParticipantTrack::Manual;
+            const bool left = rooms.leaveCompetitiveLobby(lobby.id, user.traderId);
             if (left) {
-                cancelTraderOrders(lobby.game->exchange, traderId);
+                persistence.recordSessionEvent(
+                    lobby.id,
+                    lobby.roomId,
+                    RoomMode::Competitive,
+                    user.traderId,
+                    track,
+                    "leave",
+                    Clock::now() + std::chrono::seconds(rooms.config().rejoinCooldownSeconds));
             }
 
             return jsonResponse(
                 200,
                 std::string("{\"left\":") + (left ? "true" : "false")
+                    + ",\"cooldownRemainingSeconds\":" + std::to_string(rooms.cooldownRemainingSeconds(user.traderId))
+                    + ",\"activeSession\":" + serializeActiveSession(rooms.activeSessionFor(user.traderId))
                     + ",\"lobby\":" + serializeLobby(lobby) + "}");
         }
 
-        const bool requiresMembership =
-            request.method == "POST"
-            || (request.method == "GET" && path.rfind("/me", 0) == 0);
+        if (request.method == "GET" && path == "/leaderboard") {
+            const TraderId traderId = authenticatedTraderId(request);
+            if (!lobby.wasAdmitted(traderId)) {
+                return jsonResponse(403, jsonError("join this lobby before viewing its leaderboard"));
+            }
+
+            lobby.finalizeIfNeeded(rooms.ratings(ParticipantTrack::Manual), rooms.ratings(ParticipantTrack::Bot));
+            if (lobby.hasFinalRatings() && rooms.storeLeaderboardRatings(lobby)) {
+                for (const LeaderboardRow& row : lobby.leaderboardRows()) {
+                    persistence.recordRating(lobby.id, row);
+                }
+            }
+
+            return jsonResponse(200, serializeLeaderboard(lobby.leaderboardRows()));
+        }
+
+        const bool requiresMembership = request.method == "POST" || request.method == "GET";
         if (requiresMembership) {
             const TraderId traderId = authenticatedTraderId(request);
-            if (!lobby.contains(traderId)) {
-                return jsonResponse(403, jsonError("join this lobby before trading"));
+            if (!lobby.contains(traderId) || !rooms.hasActiveSession(traderId, lobby.id)) {
+                return jsonResponse(403, jsonError("join this lobby before viewing or trading"));
+            }
+
+            const LobbyPhase phase = lobby.currentPhase();
+            if (request.method == "POST" && phase != LobbyPhase::Running) {
+                return jsonResponse(
+                    409,
+                    jsonError(phase == LobbyPhase::Finished ? "game is finished" : "game has not started yet"));
             }
         }
     } catch (const AuthError& ex) {
@@ -1645,10 +2808,10 @@ HttpResponse routeLobby(CompetitiveLobby& lobby, const HttpRequest& request) {
 
     HttpRequest scopedRequest = request;
     scopedRequest.path = path + (query.empty() ? "" : "?" + query);
-    return routeRoom(*lobby.game, scopedRequest);
+    return routeRoom(*lobby.game, persistence, lobby.id, scopedRequest);
 }
 
-HttpResponse route(RoomStore& rooms, const HttpRequest& request) {
+HttpResponse route(RoomStore& rooms, PersistenceStore& persistence, const HttpRequest& request) {
     const auto [path, query] = splitQuery(request.path);
 
     if (request.method == "OPTIONS") {
@@ -1661,11 +2824,27 @@ HttpResponse route(RoomStore& rooms, const HttpRequest& request) {
         }
 
         if (path == "/rooms") {
-            return jsonResponse(200, serializeRooms(rooms.rooms()));
+            return jsonResponse(200, serializeRooms(rooms.rooms(), false));
         }
 
         if (path == "/lobbies") {
             return jsonResponse(200, serializeLobbies(rooms.lobbies()));
+        }
+
+        if (path == "/me/session") {
+            try {
+                const AuthenticatedUser user = authenticatedUser(request);
+                persistence.upsertUser(user);
+                return jsonResponse(
+                    200,
+                    std::string("{\"traderId\":") + std::to_string(user.traderId)
+                        + ",\"cooldownRemainingSeconds\":"
+                        + std::to_string(rooms.cooldownRemainingSeconds(user.traderId))
+                        + ",\"activeSession\":" + serializeActiveSession(rooms.activeSessionFor(user.traderId))
+                        + "}");
+            } catch (const AuthError& ex) {
+                return jsonResponse(401, jsonError(ex.what()));
+            }
         }
     }
 
@@ -1678,7 +2857,7 @@ HttpResponse route(RoomStore& rooms, const HttpRequest& request) {
 
         if (roomPath->nestedPath.empty()) {
             if (request.method == "GET") {
-                return jsonResponse(200, serializeRoom(*room));
+                return jsonResponse(200, serializeRoom(*room, false));
             }
 
             return jsonResponse(405, jsonError("room detail only supports GET"));
@@ -1696,9 +2875,89 @@ HttpResponse route(RoomStore& rooms, const HttpRequest& request) {
             return jsonResponse(409, jsonError("select a competitive lobby"));
         }
 
-        HttpRequest scopedRequest = request;
-        scopedRequest.path = roomPath->nestedPath + (query.empty() ? "" : "?" + query);
-        return routeRoom(*room, scopedRequest);
+        try {
+            if (request.method == "GET" && roomPath->nestedPath == "/membership") {
+                const AuthenticatedUser user = authenticatedUser(request);
+                persistence.upsertUser(user);
+                const std::string sessionId = room->id + "-" + std::to_string(user.traderId);
+                const bool joined = rooms.hasActiveSession(user.traderId, sessionId);
+                return jsonResponse(
+                    200,
+                    std::string("{\"joined\":") + (joined ? "true" : "false")
+                        + ",\"traderId\":" + std::to_string(user.traderId)
+                        + ",\"cooldownRemainingSeconds\":"
+                        + std::to_string(rooms.cooldownRemainingSeconds(user.traderId))
+                        + ",\"activeSession\":" + serializeActiveSession(rooms.activeSessionFor(user.traderId))
+                        + ",\"room\":" + serializeRoom(*room, joined)
+                        + "}");
+            }
+
+            if (request.method == "POST" && roomPath->nestedPath == "/join") {
+                const AuthenticatedUser user = authenticatedUser(request);
+                persistence.upsertUser(user);
+                const LobbyJoinOutcome outcome = rooms.joinSingleRoom(room->id, user.traderId);
+                if (outcome.result == LobbyJoinResult::Joined) {
+                    const std::string sessionId = room->id + "-" + std::to_string(user.traderId);
+                    persistence.recordSessionEvent(sessionId, room->id, RoomMode::Single, user.traderId, ParticipantTrack::Manual, "join");
+                }
+
+                const int status = (outcome.result == LobbyJoinResult::Joined || outcome.result == LobbyJoinResult::AlreadyJoined)
+                    ? 200
+                    : 409;
+                return jsonResponse(
+                    status,
+                    serializeJoinOutcome(
+                        outcome,
+                        user.traderId,
+                        rooms.activeSessionFor(user.traderId),
+                        "\"room\":" + serializeRoom(*room, status == 200)));
+            }
+
+            if (request.method == "POST" && roomPath->nestedPath == "/leave") {
+                const AuthenticatedUser user = authenticatedUser(request);
+                persistence.upsertUser(user);
+                const bool left = rooms.leaveSingleRoom(room->id, user.traderId);
+                if (left) {
+                    const std::string sessionId = room->id + "-" + std::to_string(user.traderId);
+                    persistence.recordSessionEvent(
+                        sessionId,
+                        room->id,
+                        RoomMode::Single,
+                        user.traderId,
+                        ParticipantTrack::Manual,
+                        "leave",
+                        Clock::now() + std::chrono::seconds(rooms.config().rejoinCooldownSeconds));
+                }
+
+                return jsonResponse(
+                    200,
+                    std::string("{\"left\":") + (left ? "true" : "false")
+                        + ",\"cooldownRemainingSeconds\":"
+                        + std::to_string(rooms.cooldownRemainingSeconds(user.traderId))
+                        + ",\"activeSession\":" + serializeActiveSession(rooms.activeSessionFor(user.traderId))
+                        + ",\"room\":" + serializeRoom(*room, false)
+                        + "}");
+            }
+
+            const AuthenticatedUser user = authenticatedUser(request);
+            const std::string sessionId = room->id + "-" + std::to_string(user.traderId);
+            if (!rooms.hasActiveSession(user.traderId, sessionId)) {
+                return jsonResponse(403, jsonError("enter this room before viewing or trading"));
+            }
+
+            SinglePlayerSession* session = rooms.findSingleSession(room->id, user.traderId);
+            if (session == nullptr || !session->active) {
+                return jsonResponse(403, jsonError("enter this room before viewing or trading"));
+            }
+
+            HttpRequest scopedRequest = request;
+            scopedRequest.path = roomPath->nestedPath + (query.empty() ? "" : "?" + query);
+            return routeRoom(*session->game, persistence, session->id, scopedRequest);
+        } catch (const AuthError& ex) {
+            return jsonResponse(401, jsonError(ex.what()));
+        } catch (const std::exception& ex) {
+            return jsonResponse(400, jsonError(ex.what()));
+        }
     }
 
     const std::optional<ParsedLobbyPath> lobbyPath = parseLobbyPath(path);
@@ -1718,10 +2977,11 @@ HttpResponse route(RoomStore& rooms, const HttpRequest& request) {
 
         HttpRequest scopedRequest = request;
         scopedRequest.path = lobbyPath->nestedPath + (query.empty() ? "" : "?" + query);
-        return routeLobby(*lobby, scopedRequest);
+        return routeLobby(rooms, *lobby, persistence, scopedRequest);
     }
 
-    return routeRoom(rooms.defaultRoom(), request);
+    (void)rooms;
+    return jsonResponse(409, jsonError("select and enter a room or lobby first"));
 }
 
 std::optional<HttpRequest> parseRequest(const std::string& raw, std::size_t headerEnd) {
@@ -1872,14 +3132,17 @@ void seedRoom(GameRoom& room) {
     }
 }
 
-std::unique_ptr<GameRoom> makeSandboxRoom() {
+std::unique_ptr<GameRoom> makeSandboxRoom(const GameConfig& config) {
     auto room = std::make_unique<GameRoom>();
     room->id = "sandbox";
     room->name = "Sandbox";
     room->mode = RoomMode::Single;
     room->difficulty = "dev";
-    room->startingCash = 100000;
+    room->startingCash = config.startingCash;
     room->maxParticipants = 1;
+    room->startDelaySeconds = 0;
+    room->gameDurationSeconds = config.gameDurationSeconds;
+    room->rejoinCooldownSeconds = config.rejoinCooldownSeconds;
     room->houseLiquidity = false;
     room->assets = {
         {"BTC-USD", "Sandbox BTC", "manual-testing", "sandbox", 100, "none"},
@@ -1889,14 +3152,17 @@ std::unique_ptr<GameRoom> makeSandboxRoom() {
     return room;
 }
 
-std::unique_ptr<GameRoom> makeSinglePlayerRoom() {
+std::unique_ptr<GameRoom> makeSinglePlayerRoom(const GameConfig& config) {
     auto room = std::make_unique<GameRoom>();
     room->id = "solo-alpha";
     room->name = "Solo Alpha Lab";
     room->mode = RoomMode::Single;
     room->difficulty = "medium";
-    room->startingCash = 100000;
+    room->startingCash = config.startingCash;
     room->maxParticipants = 1;
+    room->startDelaySeconds = 0;
+    room->gameDurationSeconds = config.gameDurationSeconds;
+    room->rejoinCooldownSeconds = config.rejoinCooldownSeconds;
     room->houseLiquidity = true;
     room->assets = {
         {"NOVA", "Nova Systems", "trend-cycle", "synthetic", 100, "learnable"},
@@ -1908,14 +3174,17 @@ std::unique_ptr<GameRoom> makeSinglePlayerRoom() {
     return room;
 }
 
-std::unique_ptr<GameRoom> makeCompetitiveRoom() {
+std::unique_ptr<GameRoom> makeCompetitiveRoom(const GameConfig& config) {
     auto room = std::make_unique<GameRoom>();
     room->id = "comp-aurora";
     room->name = "Aurora Competitive";
     room->mode = RoomMode::Competitive;
     room->difficulty = "hard";
-    room->startingCash = 100000;
+    room->startingCash = config.startingCash;
     room->maxParticipants = 20;
+    room->startDelaySeconds = config.startDelaySeconds;
+    room->gameDurationSeconds = config.gameDurationSeconds;
+    room->rejoinCooldownSeconds = config.rejoinCooldownSeconds;
     room->houseLiquidity = true;
     room->assets = {
         {"AXON", "Axon Energy", "event-driven", "masked-real-series", 88, "moderate"},
@@ -1939,6 +3208,9 @@ std::unique_ptr<CompetitiveLobby> makeCompetitiveLobby(
     game->difficulty = room.difficulty;
     game->startingCash = room.startingCash;
     game->maxParticipants = capacity;
+    game->startDelaySeconds = room.startDelaySeconds;
+    game->gameDurationSeconds = room.gameDurationSeconds;
+    game->rejoinCooldownSeconds = room.rejoinCooldownSeconds;
     game->houseLiquidity = room.houseLiquidity;
     game->assets = room.assets;
     seedRoom(*game);
@@ -1948,15 +3220,18 @@ std::unique_ptr<CompetitiveLobby> makeCompetitiveLobby(
     lobby->name = lobbyName;
     lobby->roomId = room.id;
     lobby->capacity = capacity;
+    lobby->startDelaySeconds = room.startDelaySeconds;
+    lobby->gameDurationSeconds = room.gameDurationSeconds;
     lobby->game = std::move(game);
     return lobby;
 }
 
-RoomStore::RoomStore() {
-    addRoom(makeSandboxRoom());
-    addRoom(makeSinglePlayerRoom());
+RoomStore::RoomStore(GameConfig config)
+    : gameConfig(config) {
+    addRoom(makeSandboxRoom(gameConfig));
+    addRoom(makeSinglePlayerRoom(gameConfig));
 
-    std::unique_ptr<GameRoom> competitiveRoom = makeCompetitiveRoom();
+    std::unique_ptr<GameRoom> competitiveRoom = makeCompetitiveRoom(gameConfig);
     addLobby(makeCompetitiveLobby(*competitiveRoom, "aurora-open-10", "Aurora Open 10", 10));
     addLobby(makeCompetitiveLobby(*competitiveRoom, "aurora-open-15", "Aurora Open 15", 15));
     addLobby(makeCompetitiveLobby(*competitiveRoom, "aurora-open-20", "Aurora Open 20", 20));
@@ -1989,15 +3264,6 @@ CompetitiveLobby* RoomStore::findLobby(const std::string& lobbyId) {
     }
 
     return it->second.get();
-}
-
-GameRoom& RoomStore::defaultRoom() {
-    GameRoom* room = find(defaultRoomId);
-    if (room == nullptr) {
-        throw std::runtime_error("default room missing");
-    }
-
-    return *room;
 }
 
 std::vector<const GameRoom*> RoomStore::rooms() const {
@@ -2037,6 +3303,220 @@ std::vector<const CompetitiveLobby*> RoomStore::lobbiesForRoom(const std::string
     return result;
 }
 
+SinglePlayerSession* RoomStore::findSingleSession(const std::string& roomId, TraderId traderId) {
+    std::lock_guard<std::mutex> lock(sessionMutex);
+    const auto roomSessions = singleSessionsByRoom.find(roomId);
+    if (roomSessions == singleSessionsByRoom.end()) {
+        return nullptr;
+    }
+
+    const auto found = roomSessions->second.find(traderId);
+    if (found == roomSessions->second.end()) {
+        return nullptr;
+    }
+
+    return found->second.get();
+}
+
+LobbyJoinOutcome RoomStore::joinSingleRoom(const std::string& roomId, TraderId traderId) {
+    std::lock_guard<std::mutex> lock(sessionMutex);
+    const GameRoom* room = find(roomId);
+    if (room == nullptr || room->mode != RoomMode::Single) {
+        return makeJoinOutcome(LobbyJoinResult::GameClosed);
+    }
+
+    const std::string sessionId = roomId + "-" + std::to_string(traderId);
+    LobbyJoinOutcome check = canJoinSessionLocked(traderId, sessionId);
+    if (check.result == LobbyJoinResult::AlreadyJoined) {
+        return check;
+    }
+
+    if (check.result != LobbyJoinResult::Joined) {
+        return check;
+    }
+
+    auto& sessions = singleSessionsByRoom[roomId];
+    auto found = sessions.find(traderId);
+    if (found == sessions.end()) {
+        auto session = std::make_unique<SinglePlayerSession>();
+        session->id = sessionId;
+        session->roomId = roomId;
+        session->traderId = traderId;
+        session->game = cloneSingleRoom(*room);
+        session->joinedAt = Clock::now();
+        found = sessions.emplace(traderId, std::move(session)).first;
+    }
+
+    found->second->active = true;
+    found->second->joinedAt = Clock::now();
+    markJoinedLocked(traderId, {sessionId, roomId, false});
+    return makeJoinOutcome(LobbyJoinResult::Joined);
+}
+
+bool RoomStore::leaveSingleRoom(const std::string& roomId, TraderId traderId) {
+    std::lock_guard<std::mutex> lock(sessionMutex);
+    auto roomSessions = singleSessionsByRoom.find(roomId);
+    if (roomSessions == singleSessionsByRoom.end()) {
+        return false;
+    }
+
+    auto found = roomSessions->second.find(traderId);
+    if (found == roomSessions->second.end() || !found->second->active) {
+        return false;
+    }
+
+    cancelTraderOrders(found->second->game->exchange, traderId);
+    found->second->active = false;
+    markLeftLocked(traderId);
+    return true;
+}
+
+LobbyJoinOutcome RoomStore::joinCompetitiveLobby(
+    const std::string& lobbyId,
+    TraderId traderId,
+    ParticipantTrack track) {
+    CompetitiveLobby* lobby = findLobby(lobbyId);
+    if (lobby == nullptr) {
+        return makeJoinOutcome(LobbyJoinResult::GameClosed);
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(sessionMutex);
+        LobbyJoinOutcome check = canJoinSessionLocked(traderId, lobbyId);
+        if (check.result == LobbyJoinResult::AlreadyJoined && lobby->contains(traderId)) {
+            return check;
+        }
+
+        if (check.result != LobbyJoinResult::Joined) {
+            return check;
+        }
+    }
+
+    const LobbyJoinResult joinResult = lobby->join(traderId, track);
+    if (joinResult != LobbyJoinResult::Joined && joinResult != LobbyJoinResult::AlreadyJoined) {
+        return makeJoinOutcome(joinResult);
+    }
+
+    std::lock_guard<std::mutex> lock(sessionMutex);
+    markJoinedLocked(traderId, {lobbyId, lobby->roomId, true});
+    return makeJoinOutcome(joinResult);
+}
+
+bool RoomStore::leaveCompetitiveLobby(const std::string& lobbyId, TraderId traderId) {
+    CompetitiveLobby* lobby = findLobby(lobbyId);
+    if (lobby == nullptr) {
+        return false;
+    }
+
+    const bool left = lobby->leave(traderId);
+    if (!left) {
+        return false;
+    }
+
+    cancelTraderOrders(lobby->game->exchange, traderId);
+
+    std::lock_guard<std::mutex> lock(sessionMutex);
+    const auto active = activeByTrader.find(traderId);
+    if (active != activeByTrader.end() && active->second.id == lobbyId) {
+        markLeftLocked(traderId);
+    }
+
+    return true;
+}
+
+bool RoomStore::hasActiveSession(TraderId traderId, const std::string& sessionId) const {
+    std::lock_guard<std::mutex> lock(sessionMutex);
+    const auto active = activeByTrader.find(traderId);
+    return active != activeByTrader.end() && active->second.id == sessionId;
+}
+
+std::optional<ActiveSession> RoomStore::activeSessionFor(TraderId traderId) const {
+    std::lock_guard<std::mutex> lock(sessionMutex);
+    const auto active = activeByTrader.find(traderId);
+    if (active == activeByTrader.end()) {
+        return std::nullopt;
+    }
+
+    return active->second;
+}
+
+std::int64_t RoomStore::cooldownRemainingSeconds(TraderId traderId) const {
+    std::lock_guard<std::mutex> lock(sessionMutex);
+    const auto cooldown = cooldownUntilByTrader.find(traderId);
+    if (cooldown == cooldownUntilByTrader.end()) {
+        return 0;
+    }
+
+    return secondsRemaining(cooldown->second);
+}
+
+const GameConfig& RoomStore::config() const {
+    return gameConfig;
+}
+
+std::unordered_map<TraderId, int>& RoomStore::ratings(ParticipantTrack track) {
+    return track == ParticipantTrack::Bot ? botRatings : manualRatings;
+}
+
+bool RoomStore::storeLeaderboardRatings(const CompetitiveLobby& lobby) {
+    std::lock_guard<std::mutex> lock(sessionMutex);
+    if (storedRatingLobbies.contains(lobby.id)) {
+        return false;
+    }
+
+    for (const LeaderboardRow& row : lobby.leaderboardRows()) {
+        ratings(row.track)[row.traderId] = row.ratingAfter;
+    }
+
+    storedRatingLobbies.insert(lobby.id);
+    return true;
+}
+
+std::unique_ptr<GameRoom> RoomStore::cloneSingleRoom(const GameRoom& room) const {
+    auto clone = std::make_unique<GameRoom>();
+    clone->id = room.id;
+    clone->name = room.name;
+    clone->mode = room.mode;
+    clone->difficulty = room.difficulty;
+    clone->startingCash = room.startingCash;
+    clone->maxParticipants = room.maxParticipants;
+    clone->startDelaySeconds = room.startDelaySeconds;
+    clone->gameDurationSeconds = room.gameDurationSeconds;
+    clone->rejoinCooldownSeconds = room.rejoinCooldownSeconds;
+    clone->houseLiquidity = room.houseLiquidity;
+    clone->assets = room.assets;
+    seedRoom(*clone);
+    return clone;
+}
+
+LobbyJoinOutcome RoomStore::canJoinSessionLocked(TraderId traderId, const std::string& sessionId) const {
+    const auto cooldown = cooldownUntilByTrader.find(traderId);
+    if (cooldown != cooldownUntilByTrader.end() && cooldown->second > Clock::now()) {
+        return makeJoinOutcome(LobbyJoinResult::CoolingDown, secondsRemaining(cooldown->second));
+    }
+
+    const auto active = activeByTrader.find(traderId);
+    if (active != activeByTrader.end()) {
+        if (active->second.id == sessionId) {
+            return makeJoinOutcome(LobbyJoinResult::AlreadyJoined);
+        }
+
+        return makeJoinOutcome(LobbyJoinResult::ActiveElsewhere, 0, active->second.id);
+    }
+
+    return makeJoinOutcome(LobbyJoinResult::Joined);
+}
+
+void RoomStore::markJoinedLocked(TraderId traderId, const ActiveSession& session) {
+    activeByTrader[traderId] = session;
+    cooldownUntilByTrader.erase(traderId);
+}
+
+void RoomStore::markLeftLocked(TraderId traderId) {
+    activeByTrader.erase(traderId);
+    cooldownUntilByTrader[traderId] = Clock::now() + std::chrono::seconds(gameConfig.rejoinCooldownSeconds);
+}
+
 int parsePort(const char* value, int fallback) {
     if (value == nullptr || value[0] == '\0') {
         return fallback;
@@ -2062,9 +3542,17 @@ int main(int argc, char** argv) {
     try {
         SocketRuntime runtime;
         SocketHandle server = createServerSocket(port);
-        RoomStore rooms;
+        GameConfig config = GameConfig::fromEnvironment();
+        PersistenceStore persistence;
+        RoomStore rooms(config);
+        rooms.ratings(ParticipantTrack::Manual) = persistence.loadRatings(ParticipantTrack::Manual);
+        rooms.ratings(ParticipantTrack::Bot) = persistence.loadRatings(ParticipantTrack::Bot);
 
         std::cout << "Orderbook API server listening on 0.0.0.0:" << port << "\n";
+        std::cout << "Starting cash: " << config.startingCash
+                  << ", competitive start delay: " << config.startDelaySeconds
+                  << "s, game duration: " << config.gameDurationSeconds
+                  << "s, rejoin cooldown: " << config.rejoinCooldownSeconds << "s\n";
         std::cout << "Press Ctrl+C to stop.\n";
 
         while (true) {
@@ -2077,7 +3565,7 @@ int main(int argc, char** argv) {
 
             std::optional<HttpRequest> request = readRequest(client);
             if (request) {
-                sendResponse(client, route(rooms, *request));
+                sendResponse(client, route(rooms, persistence, *request));
             } else {
                 sendResponse(client, jsonResponse(400, jsonError("could not parse request")));
             }

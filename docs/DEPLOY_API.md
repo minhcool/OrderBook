@@ -13,7 +13,7 @@ render.yaml
 
 Render can build the Docker image from GitHub and run it as a public web service.
 
-The included `render.yaml` uses Render's free web service plan for the prototype. A free service can restart, so the in-memory book can clear at any time.
+The included `render.yaml` uses Render's free web service plan for the prototype and defines a Render Postgres database named `orderbook-db`. The API receives `DATABASE_URL` from that database and writes user/session/order/trade/rating history when it is available. Render free Postgres is useful for a prototype, but it has free-tier limits and expiration.
 
 ## Steps
 
@@ -23,15 +23,17 @@ The included `render.yaml` uses Render's free web service plan for the prototype
 4. Use the repo root as the service root.
 5. Let Render build and deploy.
 6. After deploy, copy the public service URL.
+7. In Render's Blueprint sync page, confirm both `orderbook-api` and `orderbook-db` exist.
 
 The API exposes:
 
 ```text
 GET /health
-GET /symbols
-GET /book/BTC-USD
-POST /orders/buy
-POST /orders/sell
+GET /rooms
+GET /rooms/comp-aurora/lobbies
+POST /rooms/solo-alpha/join
+GET /rooms/solo-alpha/symbols
+POST /rooms/solo-alpha/orders/market-buy
 ```
 
 ## Verify
@@ -40,7 +42,7 @@ Replace the URL with your Render service URL:
 
 ```powershell
 Invoke-RestMethod https://your-orderbook-api.onrender.com/health
-Invoke-RestMethod https://your-orderbook-api.onrender.com/book/BTC-USD
+Invoke-RestMethod https://your-orderbook-api.onrender.com/rooms
 ```
 
 Expected health response:
@@ -49,7 +51,7 @@ Expected health response:
 { "ok": true }
 ```
 
-Fresh deploys start with empty `BTC-USD` and `ETH-USD` books, so `/symbols` should return both symbols before any trades happen.
+Market data endpoints require a Clerk bearer token and an entered room/lobby. Public endpoints only expose room and lobby metadata.
 
 ## If Render Fails
 
@@ -75,7 +77,8 @@ The website also stores the API URL in browser local storage after you click Con
 
 ## Important Limitations
 
-- The API still stores all books in memory. Restarting the service clears the books.
+- Runtime books are still in memory. PostgreSQL stores events/history/ratings, but restart replay is not implemented yet.
+- Render free Postgres expires after its free-tier window; use a paid database before relying on durable history.
 - The backend reads the Clerk token subject but does not verify the JWT signature yet.
 - CORS is currently open for development.
 - This is a prototype deployment path, not a production trading system.

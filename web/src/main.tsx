@@ -20,16 +20,20 @@ import {
   cancelOrder,
   fetchBook,
   fetchFills,
+  fetchLeaderboard,
   fetchLobbies,
   fetchLobbyMembership,
   fetchMe,
   fetchOpenOrders,
   fetchPortfolio,
+  fetchRoomMembership,
   fetchPrice,
   fetchRooms,
   fetchSymbols,
   health,
+  joinRoom,
   joinLobby,
+  leaveRoom,
   leaveLobby,
   replaceOrder,
   submitOrder
@@ -39,6 +43,7 @@ import type {
   FillRecord,
   GameLobby,
   GameRoom,
+  LeaderboardRow,
   LobbyMembership,
   MarketScope,
   MarketPrice,
@@ -110,6 +115,7 @@ function App() {
   const [openOrders, setOpenOrders] = React.useState<OpenOrder[]>([]);
   const [fills, setFills] = React.useState<FillRecord[]>([]);
   const [portfolio, setPortfolio] = React.useState<PortfolioRecord | null>(null);
+  const [leaderboard, setLeaderboard] = React.useState<LeaderboardRow[]>([]);
 
   const [side, setSide] = React.useState<Side>("buy");
   const [mode, setMode] = React.useState<OrderMode>("limit");
@@ -123,13 +129,20 @@ function App() {
   const [cancelId, setCancelId] = React.useState("1001");
 
   const selectedRoom = rooms.find((room) => room.id === roomId);
-  const selectedLobby = lobbies.find((lobby) => lobby.id === lobbyId);
   const isCompetitive = selectedRoom?.mode === "competitive";
+  const selectedLobby = (isCompetitive ? membership?.lobby : undefined) ?? lobbies.find((lobby) => lobby.id === lobbyId);
+  const selectedRoomDetails = membership?.room ?? selectedRoom;
   const activeScope: MarketScope = {
     roomId,
     ...(isCompetitive ? { lobbyId } : {})
   };
-  const canTrade = Boolean(isSignedIn && selectedRoom) && (!isCompetitive || membership?.joined === true);
+  const isEntered = membership?.joined === true;
+  const canViewMarket = Boolean(isSignedIn && selectedRoom && isEntered);
+  const gameIsRunning = !isCompetitive || selectedLobby?.phase === "running";
+  const canTrade = canViewMarket && gameIsRunning;
+  const cooldownRemaining = membership?.cooldownRemainingSeconds ?? 0;
+  const entryDisabled = cooldownRemaining > 0
+    || (isCompetitive && selectedLobby?.status !== "open");
 
   const pushActivity = React.useCallback((title: string, detail: string, ok: boolean) => {
     setActivity((items) => [{ id: Date.now() + Math.random(), title, detail, ok }, ...items].slice(0, 8));
@@ -172,16 +185,20 @@ function App() {
         throw new Error("This competitive room has no available lobbies");
       }
 
+      let nextMembership: LobbyMembership | null = null;
       const scope: MarketScope = {
         roomId: activeRoom.id,
         ...(activeLobby ? { lobbyId: activeLobby.id } : {})
       };
-      const nextSymbols = await fetchSymbols(apiBase, scope);
-      const activeSymbol = nextSymbols.includes(symbol) ? symbol : nextSymbols[0] ?? symbol;
-      const [nextBook, nextMarketPrice] = await Promise.all([
-        fetchBook(apiBase, scope, activeSymbol, 10),
-        fetchPrice(apiBase, scope, activeSymbol)
-      ]);
+
+      if (isLoaded && isSignedIn) {
+        const token = await getToken();
+        if (token) {
+          nextMembership = activeRoom.mode === "competitive" && activeLobby
+            ? await fetchLobbyMembership(apiBase, activeLobby.id, token)
+            : await fetchRoomMembership(apiBase, activeRoom.id, token);
+        }
+      }
 
       setRooms(nextRooms);
       setRoomId(activeRoom.id);
@@ -189,10 +206,31 @@ function App() {
       if (activeLobby) {
         setLobbyId(activeLobby.id);
       }
-      setSymbol(activeSymbol);
-      setBook(nextBook);
-      setSymbols(nextSymbols);
-      setMarketPrice(nextMarketPrice);
+      setMembership(nextMembership);
+
+      if (nextMembership?.joined) {
+        const nextSymbols = await fetchSymbols(apiBase, scope);
+        const activeSymbol = nextSymbols.includes(symbol) ? symbol : nextSymbols[0] ?? symbol;
+        const [nextBook, nextMarketPrice] = await Promise.all([
+          fetchBook(apiBase, scope, activeSymbol, 10),
+          fetchPrice(apiBase, scope, activeSymbol)
+        ]);
+
+        setSymbol(activeSymbol);
+        setBook(nextBook);
+        setSymbols(nextSymbols);
+        setMarketPrice(nextMarketPrice);
+      } else {
+        setBook({ symbol, bids: [], asks: [] });
+        setSymbols([]);
+        setMarketPrice(null);
+        setMe(null);
+        setOpenOrders([]);
+        setFills([]);
+        setPortfolio(null);
+        setLeaderboard([]);
+      }
+
       setApiOnline(true);
     } catch (error) {
       setApiOnline(false);
@@ -200,7 +238,7 @@ function App() {
     } finally {
       setLoading(false);
     }
-  }, [apiBase, lobbyId, pushActivity, roomId, symbol]);
+  }, [apiBase, getToken, isLoaded, isSignedIn, lobbyId, pushActivity, roomId, symbol]);
 
   const refreshAccount = React.useCallback(async () => {
     if (!isLoaded || !isSignedIn) {
@@ -209,10 +247,11 @@ function App() {
       setOpenOrders([]);
       setFills([]);
       setPortfolio(null);
+      setLeaderboard([]);
       return;
     }
 
-    if (rooms.length === 0 || (isCompetitive && !lobbyId)) {
+    if (rooms.length === 0 || !selectedRoom || (isCompetitive && !lobbyId)) {
       return;
     }
 
@@ -222,18 +261,21 @@ function App() {
         throw new Error("Could not read Clerk session token");
       }
 
-      if (isCompetitive) {
-        const nextMembership = await fetchLobbyMembership(apiBase, lobbyId, token);
-        setMembership(nextMembership);
-        if (!nextMembership.joined) {
-          setMe(null);
-          setOpenOrders([]);
-          setFills([]);
-          setPortfolio(null);
-          return;
-        }
-      } else {
-        setMembership(null);
+      const nextMembership = isCompetitive
+        ? await fetchLobbyMembership(apiBase, lobbyId, token)
+        : await fetchRoomMembership(apiBase, roomId, token);
+      setMembership(nextMembership);
+      if (nextMembership.lobby) {
+        setLobbies((items) => items.map((item) => item.id === nextMembership.lobby?.id ? nextMembership.lobby : item));
+      }
+
+      if (!nextMembership.joined) {
+        setMe(null);
+        setOpenOrders([]);
+        setFills([]);
+        setPortfolio(null);
+        setLeaderboard([]);
+        return;
       }
 
       const scope: MarketScope = {
@@ -246,15 +288,17 @@ function App() {
         fetchFills(apiBase, scope, token),
         fetchPortfolio(apiBase, scope, token)
       ]);
+      const nextLeaderboard = isCompetitive ? await fetchLeaderboard(apiBase, lobbyId, token) : [];
 
       setMe(nextMe);
       setOpenOrders(nextOpenOrders);
       setFills(nextFills);
       setPortfolio(nextPortfolio);
+      setLeaderboard(nextLeaderboard);
     } catch (error) {
       pushActivity("Account refresh failed", error instanceof Error ? error.message : "Request failed", false);
     }
-  }, [apiBase, getToken, isCompetitive, isLoaded, isSignedIn, lobbyId, pushActivity, roomId, rooms.length]);
+  }, [apiBase, getToken, isCompetitive, isLoaded, isSignedIn, lobbyId, pushActivity, roomId, rooms.length, selectedRoom]);
 
   const refreshAll = React.useCallback(async () => {
     await Promise.all([refresh(), refreshAccount()]);
@@ -325,39 +369,70 @@ function App() {
     }
   }
 
-  async function handleJoinLobby() {
+  async function handleEnterSession() {
     try {
       const token = await requireToken();
-      const result = await joinLobby(apiBase, lobbyId, token);
-      setMembership({ joined: result.joined, traderId: 0 });
-      setLobbies((items) => items.map((item) => item.id === result.lobby.id ? result.lobby : item));
-      pushActivity("Lobby joined", `${result.lobby.name}: ${result.lobby.participantCount}/${result.lobby.capacity}`, true);
-      await refreshAccount();
+      const result = isCompetitive
+        ? await joinLobby(apiBase, lobbyId, token)
+        : await joinRoom(apiBase, roomId, token);
+      setMembership({
+        joined: result.joined,
+        traderId: result.traderId,
+        cooldownRemainingSeconds: result.cooldownRemainingSeconds,
+        activeSession: result.activeSession,
+        lobby: result.lobby,
+        room: result.room
+      });
+      if (result.lobby) {
+        setLobbies((items) => items.map((item) => item.id === result.lobby?.id ? result.lobby : item));
+      }
+      pushActivity(
+        result.joined ? "Entered session" : "Enter failed",
+        result.lobby
+          ? `${result.lobby.name}: ${result.lobby.participantCount}/${result.lobby.capacity}`
+          : result.message,
+        result.joined
+      );
+      await refreshAll();
     } catch (error) {
-      pushActivity("Join failed", error instanceof Error ? error.message : "Request failed", false);
+      pushActivity("Enter failed", error instanceof Error ? error.message : "Request failed", false);
     }
   }
 
-  async function handleLeaveLobby() {
+  async function handleExitSession() {
     try {
       const token = await requireToken();
-      const result = await leaveLobby(apiBase, lobbyId, token);
+      const result = isCompetitive
+        ? await leaveLobby(apiBase, lobbyId, token)
+        : await leaveRoom(apiBase, roomId, token);
       setMembership(null);
-      setLobbies((items) => items.map((item) => item.id === result.lobby.id ? result.lobby : item));
+      if (result.lobby) {
+        setLobbies((items) => items.map((item) => item.id === result.lobby?.id ? result.lobby : item));
+      }
       setMe(null);
       setOpenOrders([]);
       setFills([]);
       setPortfolio(null);
-      pushActivity("Lobby left", "Your resting orders in this lobby were canceled", true);
+      setLeaderboard([]);
+      setSymbols([]);
+      setBook({ symbol, bids: [], asks: [] });
+      setMarketPrice(null);
+      pushActivity(
+        "Exited session",
+        result.cooldownRemainingSeconds > 0
+          ? `Resting orders canceled. Cooldown ${result.cooldownRemainingSeconds}s`
+          : "Resting orders canceled",
+        true
+      );
       await refresh();
     } catch (error) {
-      pushActivity("Leave failed", error instanceof Error ? error.message : "Request failed", false);
+      pushActivity("Exit failed", error instanceof Error ? error.message : "Request failed", false);
     }
   }
 
   const spread = book.bids.length > 0 && book.asks.length > 0 ? book.asks[0].price - book.bids[0].price : null;
   const signedInName = user?.primaryEmailAddress?.emailAddress ?? user?.fullName ?? user?.id ?? "Signed in";
-  const selectedAsset = selectedRoom?.assets.find((asset) => asset.symbol === symbol);
+  const selectedAsset = selectedRoomDetails?.assets.find((asset) => asset.symbol === symbol);
 
   return (
     <main className="shell">
@@ -401,6 +476,9 @@ function App() {
             onChange={(event) => {
               setRoomId(event.target.value);
               setMembership(null);
+              setSymbols([]);
+              setBook({ symbol, bids: [], asks: [] });
+              setMarketPrice(null);
             }}
           >
             {rooms.length === 0 ? (
@@ -422,6 +500,9 @@ function App() {
             onChange={(event) => {
               setLobbyId(event.target.value);
               setMembership(null);
+              setSymbols([]);
+              setBook({ symbol, bids: [], asks: [] });
+              setMarketPrice(null);
             }}
           >
             {!isCompetitive ? (
@@ -437,45 +518,60 @@ function App() {
         </label>
         <label>
           Symbol
-          <input value={symbol} onChange={(event) => setSymbol(event.target.value.toUpperCase())} />
+          <input
+            value={symbol}
+            disabled={!canViewMarket}
+            onChange={(event) => setSymbol(event.target.value.toUpperCase())}
+          />
         </label>
         <button type="button" onClick={() => void refreshAll()}>
           <PlugZap size={17} />
           Connect
         </button>
         <div className="symbols">
-          {symbols.map((item) => (
-            <button key={item} type="button" className={item === symbol ? "selected" : ""} onClick={() => setSymbol(item)}>
-              {item}
-            </button>
-          ))}
+          {canViewMarket
+            ? symbols.map((item) => (
+                <button key={item} type="button" className={item === symbol ? "selected" : ""} onClick={() => setSymbol(item)}>
+                  {item}
+                </button>
+              ))
+            : null}
         </div>
         <div className="room-meta">
           <span>{selectedRoom?.mode ?? "single"}</span>
           <span>{selectedRoom?.difficulty ?? "dev"}</span>
-          <span>{selectedAsset?.behavior ?? "manual"}</span>
-          <span>{selectedAsset?.source ?? "sandbox"}</span>
+          <span>cash {selectedRoom ? formatNumber(selectedRoom.startingCash) : "-"}</span>
+          <span>{selectedAsset?.behavior ?? "locked"}</span>
+          <span>{selectedAsset?.source ?? "locked"}</span>
           {selectedLobby ? (
             <>
               <span>{selectedLobby.participantCount}/{selectedLobby.capacity} players</span>
-              <span>{selectedLobby.status}</span>
+              <span>{selectedLobby.phase}</span>
+              {selectedLobby.phase === "starting" ? <span>starts {selectedLobby.startsInSeconds}s</span> : null}
+              {selectedLobby.phase === "running" ? <span>ends {selectedLobby.endsInSeconds}s</span> : null}
             </>
           ) : null}
-          {isCompetitive && isSignedIn ? (
-            membership?.joined ? (
-              <button type="button" className="lobby-action leave" onClick={() => void handleLeaveLobby()}>
+          {isSignedIn && selectedRoom ? (
+            isEntered ? (
+              <button type="button" className="lobby-action leave" onClick={() => void handleExitSession()}>
                 <LogOut size={16} />
-                Leave lobby
+                Exit
               </button>
             ) : (
               <button
                 type="button"
                 className="lobby-action join"
-                disabled={selectedLobby?.status === "full"}
-                onClick={() => void handleJoinLobby()}
+                disabled={entryDisabled}
+                onClick={() => void handleEnterSession()}
               >
                 <UserPlus size={16} />
-                {selectedLobby?.status === "full" ? "Lobby full" : "Join lobby"}
+                {cooldownRemaining > 0
+                  ? `Wait ${cooldownRemaining}s`
+                  : isCompetitive
+                    ? selectedLobby?.status !== "open"
+                      ? selectedLobby?.status === "full" ? "Lobby full" : "Lobby locked"
+                      : "Join lobby"
+                    : "Enter room"}
               </button>
             )
           ) : null}
@@ -497,10 +593,14 @@ function App() {
             <Server size={18} />
             <h2>Book</h2>
           </div>
-          <div className="book-grid">
-            <BookSide title="Bids" levels={book.bids} tone="bid" />
-            <BookSide title="Asks" levels={book.asks} tone="ask" />
-          </div>
+          {!canViewMarket ? (
+            <div className="locked-state">Enter the selected room or lobby to view market data.</div>
+          ) : (
+            <div className="book-grid">
+              <BookSide title="Bids" levels={book.bids} tone="bid" />
+              <BookSide title="Asks" levels={book.asks} tone="ask" />
+            </div>
+          )}
         </section>
 
         <section className="panel ticket-panel">
@@ -516,10 +616,20 @@ function App() {
                 <span>Orders are tied to your Clerk user. Trader ID is assigned by the API.</span>
               </div>
             </Show>
-            {isSignedIn && isCompetitive && !membership?.joined ? (
+            {isSignedIn && !isEntered ? (
               <div className="auth-callout">
-                <strong>Join this lobby to trade</strong>
-                <span>You can inspect its market first. Capacity is enforced by the API.</span>
+                <strong>{isCompetitive ? "Join this lobby" : "Enter this room"}</strong>
+                <span>Market data and orders unlock after the API confirms entry.</span>
+              </div>
+            ) : null}
+            {isSignedIn && isEntered && isCompetitive && !gameIsRunning ? (
+              <div className="auth-callout">
+                <strong>{selectedLobby?.phase === "finished" ? "Game finished" : "Waiting for start"}</strong>
+                <span>
+                  {selectedLobby?.phase === "starting"
+                    ? `Trading opens in ${selectedLobby.startsInSeconds}s.`
+                    : "Trading opens when the lobby reaches the start condition."}
+                </span>
               </div>
             ) : null}
             <Segmented<Side> value={side} onChange={setSide} options={[
@@ -621,7 +731,9 @@ function App() {
           openOrders={openOrders}
           fills={fills}
           portfolio={portfolio}
+          leaderboard={leaderboard}
           isSignedIn={Boolean(isSignedIn)}
+          isEntered={isEntered}
           onRefresh={() => void refreshAccount()}
         />
       </div>
@@ -667,14 +779,18 @@ function AccountPanel({
   openOrders,
   fills,
   portfolio,
+  leaderboard,
   isSignedIn,
+  isEntered,
   onRefresh
 }: {
   me: MeSummary | null;
   openOrders: OpenOrder[];
   fills: FillRecord[];
   portfolio: PortfolioRecord | null;
+  leaderboard: LeaderboardRow[];
   isSignedIn: boolean;
+  isEntered: boolean;
   onRefresh: () => void;
 }) {
   const positions = portfolio?.positions ?? [];
@@ -684,7 +800,7 @@ function AccountPanel({
       <div className="panel-title">
         <Activity size={18} />
         <h2>Account</h2>
-        <button className="icon-button ghost" type="button" onClick={onRefresh} title="Refresh account" disabled={!isSignedIn}>
+        <button className="icon-button ghost" type="button" onClick={onRefresh} title="Refresh account" disabled={!isSignedIn || !isEntered}>
           <RefreshCw size={17} />
         </button>
       </div>
@@ -694,6 +810,11 @@ function AccountPanel({
           <strong>Sign in required</strong>
           <span>Your orders, fills, and positions are keyed by your Clerk user.</span>
         </div>
+      ) : !isEntered ? (
+        <div className="auth-callout">
+          <strong>Enter a session</strong>
+          <span>Cash, positions, orders, and fills are scoped to the active room or lobby.</span>
+        </div>
       ) : (
         <>
           <div className="account-summary">
@@ -702,8 +823,16 @@ function AccountPanel({
               <strong>{me ? formatNumber(me.traderId) : "-"}</strong>
             </div>
             <div className="account-stat">
-              <span>Cash Flow</span>
-              <strong>{portfolio ? formatSignedNumber(portfolio.cashFlow) : "-"}</strong>
+              <span>Cash</span>
+              <strong>{portfolio ? formatSignedNumber(portfolio.cash) : "-"}</strong>
+            </div>
+            <div className="account-stat">
+              <span>Available</span>
+              <strong>{portfolio ? formatSignedNumber(portfolio.availableCash) : "-"}</strong>
+            </div>
+            <div className="account-stat">
+              <span>Reserved</span>
+              <strong>{portfolio ? formatSignedNumber(portfolio.reservedCash) : "-"}</strong>
             </div>
             <div className="account-stat">
               <span>Market Value</span>
@@ -797,6 +926,25 @@ function AccountPanel({
                 ))
               )}
             </AccountSection>
+
+            {leaderboard.length > 0 ? (
+              <AccountSection title="Leaderboard">
+                {leaderboard.map((row) => (
+                  <div className="data-row" key={`${row.track}-${row.traderId}`}>
+                    <div className="data-main">
+                      <strong>
+                        #{row.rank} <span className="side-chip neutral">{row.track}</span>
+                      </strong>
+                      <span>Trader {formatNumber(row.traderId)}</span>
+                    </div>
+                    <div className="data-values">
+                      <strong>{formatSignedNumber(row.pnl)}</strong>
+                      <span>Elo {row.ratingBefore} {"->"} {row.ratingAfter}</span>
+                    </div>
+                  </div>
+                ))}
+              </AccountSection>
+            ) : null}
           </div>
         </>
       )}

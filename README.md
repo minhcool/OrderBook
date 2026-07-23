@@ -14,17 +14,23 @@ The project currently provides an in-memory orderbook library with:
 - Clerk login support in the website
 - server-assigned HTTP order IDs
 - authenticated open-order, fill-history, and derived-position endpoints
-- public trade tape, last-trade marks, and simple portfolio valuation
+- room/lobby trade tape, last-trade marks, and simple portfolio valuation
 - single-player and competitive game rooms
 - multiple competitive lobbies with independent books and enforced capacities
-- authenticated lobby join/leave membership
+- authenticated room/lobby enter and exit
+- one active session per user
+- one-minute leave/rejoin cooldown by default
+- waiting/starting/running/finished competitive lobby lifecycle
+- starting cash, available cash, reserved cash, and no-short/no-overspend checks
+- manual and bot tracks with chess-style Elo updates at game end
+- optional PostgreSQL event/history persistence through `DATABASE_URL`
 - fictional room assets, including synthetic and masked-real-series profiles
 - room-scoped order books and portfolios
 - coarse-grained mutex protection
 - correctness tests
 - performance benchmarks
 
-It is not connected to a real exchange or database yet. The current API and website are development prototypes; all orderbook state is in memory and disappears when the API process restarts.
+It is not connected to a real exchange. The current API and website are development prototypes. Runtime order books are still held in memory, while PostgreSQL records users, session events, orders, cancels, trades, and ratings when `DATABASE_URL` is configured.
 
 The game direction is:
 
@@ -149,12 +155,12 @@ For deploying the C++ API server, see [docs/DEPLOY_API.md](docs/DEPLOY_API.md).
 - No WebSocket/FIX API yet.
 - Website uses Clerk login, but roles are not implemented yet.
 - Backend JWT signature verification is not implemented yet; the current API auth bridge is for development.
-- No durable balances, deposits, withdrawals, margin, or settlement.
-- Portfolio values are estimates from trade cash flow and in-memory last-trade marks.
-- Competitive lobbies are currently seeded at startup; dynamic lobby creation, ready states, game clocks, and matchmaking are not implemented yet.
-- No leaderboard, news engine, or bot tournament scheduler yet.
+- Runtime books/account state are not rehydrated from PostgreSQL on restart yet.
+- No deposits, withdrawals, margin, or settlement.
+- Portfolio values are estimates from starting cash, fill cash flow, reserved cash, and in-memory last-trade marks.
+- Competitive lobbies are currently seeded at startup; dynamic lobby creation and matchmaking are not implemented yet.
+- No news engine or bot tournament scheduler yet.
 - Masked-real-series assets are only metadata placeholders until a licensed historical data import exists.
-- No persistence or event log.
 - No tick size or lot size validation.
 - Cancel and replace still scan the book instead of using an order ID index.
 - Mutex locking is correct but coarse-grained.

@@ -2,13 +2,13 @@
 
 The website is a Vite/React app in `web/`. It is a browser UI for the trading game API server.
 
-Users can pick a room, choose an asset, and trade against either a single-player house-liquidity market or a competitive lobby. Competitive rooms expose multiple independent lobbies with different participant capacities.
+Users can pick a room/lobby, enter that session, choose an asset, and trade against either a single-player house-liquidity market or a competitive lobby. Competitive rooms expose multiple independent lobbies with different participant capacities.
 
-Authentication is handled by Clerk. Signed-in users can submit, replace, and cancel orders. The website sends a Clerk bearer token to the C++ API server.
+Authentication is handled by Clerk. Signed-in users can enter exactly one active session, then submit, replace, and cancel orders. Leaving cancels resting orders and starts a short cooldown before re-entering.
 
 New order IDs are assigned by the API server. The website shows returned IDs in activity and uses them for replace/cancel actions.
 
-Signed-in users can also see their account panel: current open orders, recent fills/trades, positions derived from those fills, cash flow, marked market value, estimated value, and unrealized PnL.
+Signed-in users can also see their account panel after entering a session: current open orders, recent fills/trades, positions derived from those fills, cash, reserved cash, available cash, marked market value, estimated value, and unrealized PnL.
 
 ## Local Run
 
@@ -98,15 +98,17 @@ POST /lobbies/{lobbyId}/leave
 
 After joining, books, orders, fills, and portfolio requests use `/lobbies/{lobbyId}/...`. The lobby selector displays current participants and capacity. Leaving cancels the user's resting orders in that lobby.
 
-The market strip reads:
+Competitive lobbies have `waiting`, `starting`, `running`, and `finished` phases. The website shows the timer and disables order entry until the selected lobby is `running`.
+
+After entering, the market strip reads:
 
 ```text
 GET /rooms/{roomId}/prices/{symbol}
 ```
 
-This data is currently in memory on the C++ API server. It is enough to test a real user flow, but it is not durable yet: restarting or redeploying the API clears the books, trade tape, fills, derived positions, and portfolio marks.
+Runtime books/account state are currently in memory on the C++ API server. PostgreSQL records events/history/ratings when `DATABASE_URL` exists, but restart replay is not implemented yet.
 
-Portfolio value is estimated from room starting cash, trade cash flow, and last-trade marks. It is not a real account balance yet because deposits, withdrawals, and reserves are not implemented.
+Portfolio value is estimated from room starting cash, trade cash flow, reserved cash, and last-trade marks. It is not a real brokerage account because deposits, withdrawals, margin, and settlement are not implemented.
 
 ## Clerk Setup
 

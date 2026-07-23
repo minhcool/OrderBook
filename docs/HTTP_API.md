@@ -25,15 +25,17 @@ Stop it with `Ctrl+C`.
 
 ## Notes
 
-- The server stores all state in memory.
-- Restarting the server clears all books.
-- One symbol maps to one orderbook.
-- The API server starts with a backward-compatible `sandbox` room and game definitions for single-player and competitive trading.
-- A competitive room has multiple independent lobbies. Each lobby owns its own order books, trade history, accounts, and participant capacity.
-- Old routes like `/book/BTC-USD` use the `sandbox` room. Single-player routes use `/rooms/{roomId}/...`; competitive market routes use `/lobbies/{lobbyId}/...`.
+- Runtime order books are in memory. PostgreSQL records users, session events, order events, trades, cancels, and ratings when `DATABASE_URL` is set.
+- Runtime books/account state are not rehydrated from PostgreSQL after restart yet.
+- One symbol maps to one orderbook inside one active room/lobby session.
+- Public endpoints list rooms and lobby capacity/status only. Symbols, books, prices, trades, orders, and account data require entering the selected room/lobby first.
+- Each authenticated user can have exactly one active session. Leaving cancels resting orders and starts a rejoin cooldown, 60 seconds by default.
+- Single-player routes use `/rooms/{roomId}/...`; competitive market routes use `/lobbies/{lobbyId}/...`.
+- A competitive room has multiple independent lobbies. Each lobby owns its own order books, trade history, accounts, participant capacity, timer, and lifecycle.
+- Competitive lobby phases are `waiting`, `starting`, `running`, and `finished`. New players can join only while the lobby is `waiting` or `starting`; orders are accepted only while a joined lobby is `running`.
 - New order IDs are assigned by the server. Clients pass `orderId` only when replacing or canceling an existing order.
-- Open orders, fills, and positions are also stored/read in memory.
-- Price marks are based on the public trade tape. The current portfolio mark uses the last trade price; `/prices` also exposes VWAPs over the last 3, 5, and 10 trades.
+- Cash and position checks reject overspending and selling shares the user does not own.
+- Price marks are based on the room/lobby trade tape. The current portfolio mark uses the last trade price; `/prices` also exposes VWAPs over the last 3, 5, and 10 trades.
 - Request bodies are flat JSON objects.
 - The parser is intentionally tiny and only supports the fields shown here.
 - POST order endpoints and `/me` endpoints require `Authorization: Bearer <Clerk session token>`.
@@ -59,6 +61,7 @@ Rooms:
 ```http
 GET /rooms
 GET /rooms/{roomId}
+GET /me/session
 ```
 
 Response:
@@ -73,23 +76,25 @@ Response:
       "difficulty": "medium",
       "startingCash": 100000,
       "maxParticipants": 1,
+      "startDelaySeconds": 0,
+      "gameDurationSeconds": 600,
+      "rejoinCooldownSeconds": 60,
       "houseLiquidity": true,
-      "assets": [
-        {
-          "symbol": "NOVA",
-          "displayName": "Nova Systems",
-          "behavior": "trend-cycle",
-          "source": "synthetic",
-          "referencePrice": 100,
-          "signalQuality": "learnable"
-        }
-      ]
+      "assets": []
     }
   ]
 }
 ```
 
-The asset `source` may say `masked-real-series`, but the API does not reveal the real-world backing symbol.
+Public room responses intentionally hide assets. Enter the room/lobby and call `/symbols` to see tradable symbols. The asset `source` may say `masked-real-series`, but the API does not reveal the real-world backing symbol.
+
+Enter or exit a single-player room:
+
+```http
+GET  /rooms/{roomId}/membership
+POST /rooms/{roomId}/join
+POST /rooms/{roomId}/leave
+```
 
 Competitive lobbies:
 
@@ -109,9 +114,17 @@ Response:
       "name": "Aurora Open 10",
       "roomId": "comp-aurora",
       "status": "open",
+      "phase": "waiting",
       "participantCount": 0,
       "capacity": 10,
-      "spotsRemaining": 10
+      "spotsRemaining": 10,
+      "minStartParticipants": 5,
+      "startDelaySeconds": 90,
+      "gameDurationSeconds": 600,
+      "startsAt": null,
+      "endsAt": null,
+      "startsInSeconds": 0,
+      "endsInSeconds": 0
     }
   ]
 }
@@ -123,14 +136,40 @@ Joining and leaving require a Clerk bearer token:
 GET  /lobbies/{lobbyId}/membership
 POST /lobbies/{lobbyId}/join
 POST /lobbies/{lobbyId}/leave
+GET  /lobbies/{lobbyId}/leaderboard
 ```
 
-Joining is idempotent. A full lobby returns `409`. Leaving cancels that trader's resting orders in the lobby. Public books and market data can be inspected without joining, while order and `/me` endpoints return `403` until the authenticated trader joins.
+Lobby `status` is `open`, `full`, or `closed`. `closed` means the game is already running or finished, so new users cannot enter. A previously admitted player may re-enter a running lobby after their cooldown if there is still an active seat available. Joining is idempotent. A full lobby, closed lobby, active session elsewhere, or cooldown returns `409`. Leaving cancels that trader's resting orders in the lobby. Market data, orders, and `/me` endpoints return `403` until the authenticated trader enters the selected room/lobby.
+
+Lobby join accepts an optional body:
+
+```json
+{ "track": "manual" }
+```
+
+Bots should send `{ "track": "bot" }` so their Elo stays separate from manual users.
+
+Leaderboard rows are available after a competitive lobby finishes. PnL is based on final estimated portfolio value versus starting cash. Manual users and bots are rated separately with a chess-style Elo update:
+
+```json
+{
+  "leaderboard": [
+    {
+      "rank": 1,
+      "traderId": 194214855,
+      "track": "manual",
+      "pnl": 250,
+      "estimatedValue": 100250,
+      "ratingBefore": 1200,
+      "ratingAfter": 1216
+    }
+  ]
+}
+```
 
 Known symbols:
 
 ```http
-GET /symbols
 GET /rooms/{roomId}/symbols
 GET /lobbies/{lobbyId}/symbols
 ```
@@ -144,8 +183,6 @@ Response:
 Market prices:
 
 ```http
-GET /prices
-GET /prices/{symbol}
 GET /rooms/{roomId}/prices
 GET /rooms/{roomId}/prices/{symbol}
 GET /lobbies/{lobbyId}/prices
@@ -173,9 +210,8 @@ Response:
 Recent market trades:
 
 ```http
-GET /trades/{symbol}
-GET /trades/{symbol}?limit=50
 GET /rooms/{roomId}/trades/{symbol}?limit=50
+GET /lobbies/{lobbyId}/trades/{symbol}?limit=50
 ```
 
 Response:
@@ -202,9 +238,8 @@ Response:
 Book snapshot:
 
 ```http
-GET /book/{symbol}
-GET /book/{symbol}?depth=5
 GET /rooms/{roomId}/book/{symbol}
+GET /lobbies/{lobbyId}/book/{symbol}
 ```
 
 Response:
@@ -343,6 +378,10 @@ Response:
   "traderId": 194214855,
   "startingCash": 100000,
   "cashFlow": -607,
+  "cash": 99393,
+  "reservedCash": 0,
+  "availableCash": 99393,
+  "reservedLongQuantity": 0,
   "marketValue": 630,
   "estimatedValue": 100023,
   "tradingPnl": 23,
@@ -367,17 +406,20 @@ Response:
 
 ## POST Endpoints
 
-Every order endpoint also works inside a game room:
+Every order endpoint must be scoped to an entered room or lobby:
 
 ```text
 /rooms/{roomId}/orders/...
+/lobbies/{lobbyId}/orders/...
 ```
 
 Regular limit orders:
 
 ```http
-POST /orders/buy
-POST /orders/sell
+POST /rooms/{roomId}/orders/buy
+POST /rooms/{roomId}/orders/sell
+POST /lobbies/{lobbyId}/orders/buy
+POST /lobbies/{lobbyId}/orders/sell
 ```
 
 Body:
@@ -393,8 +435,10 @@ Body:
 Market orders:
 
 ```http
-POST /orders/market-buy
-POST /orders/market-sell
+POST /rooms/{roomId}/orders/market-buy
+POST /rooms/{roomId}/orders/market-sell
+POST /lobbies/{lobbyId}/orders/market-buy
+POST /lobbies/{lobbyId}/orders/market-sell
 ```
 
 Body:
@@ -409,8 +453,10 @@ Body:
 IOC orders:
 
 ```http
-POST /orders/ioc-buy
-POST /orders/ioc-sell
+POST /rooms/{roomId}/orders/ioc-buy
+POST /rooms/{roomId}/orders/ioc-sell
+POST /lobbies/{lobbyId}/orders/ioc-buy
+POST /lobbies/{lobbyId}/orders/ioc-sell
 ```
 
 Body:
@@ -426,8 +472,10 @@ Body:
 FOK orders:
 
 ```http
-POST /orders/fok-buy
-POST /orders/fok-sell
+POST /rooms/{roomId}/orders/fok-buy
+POST /rooms/{roomId}/orders/fok-sell
+POST /lobbies/{lobbyId}/orders/fok-buy
+POST /lobbies/{lobbyId}/orders/fok-sell
 ```
 
 Body:
@@ -443,8 +491,10 @@ Body:
 Replace resting orders:
 
 ```http
-POST /orders/replace-buy
-POST /orders/replace-sell
+POST /rooms/{roomId}/orders/replace-buy
+POST /rooms/{roomId}/orders/replace-sell
+POST /lobbies/{lobbyId}/orders/replace-buy
+POST /lobbies/{lobbyId}/orders/replace-sell
 ```
 
 Body:
@@ -461,7 +511,8 @@ Body:
 Cancel:
 
 ```http
-POST /orders/cancel
+POST /rooms/{roomId}/orders/cancel
+POST /lobbies/{lobbyId}/orders/cancel
 ```
 
 Body:
@@ -512,48 +563,46 @@ Cancel returns:
 Set a token first:
 
 ```powershell
-$env:CLERK_TOKEN_A = "paste_a_clerk_session_jwt_for_user_a_here"
-$env:CLERK_TOKEN_B = "paste_a_clerk_session_jwt_for_user_b_here"
+$env:CLERK_TOKEN = "paste_a_clerk_session_jwt_here"
+$headers = @{ Authorization = "Bearer $env:CLERK_TOKEN" }
 ```
 
-Place a sell:
+Enter solo mode:
 
 ```powershell
-$sellerHeaders = @{ Authorization = "Bearer $env:CLERK_TOKEN_A" }
-$body = @{ symbol = "BTC-USD"; price = 100; quantity = 5 } | ConvertTo-Json
-$sell = Invoke-RestMethod -Method Post -Uri http://localhost:8080/orders/sell -Headers $sellerHeaders -ContentType "application/json" -Body $body
-$sell.orderId
+Invoke-RestMethod -Method Post -Uri http://localhost:8080/rooms/solo-alpha/join -Headers $headers -ContentType "application/json" -Body "{}"
 ```
 
-Place a crossing buy from a different user:
+Read allowed symbols:
 
 ```powershell
-$buyerHeaders = @{ Authorization = "Bearer $env:CLERK_TOKEN_B" }
-$body = @{ symbol = "BTC-USD"; price = 100; quantity = 3 } | ConvertTo-Json
-Invoke-RestMethod -Method Post -Uri http://localhost:8080/orders/buy -Headers $buyerHeaders -ContentType "application/json" -Body $body
+Invoke-RestMethod -Method Get -Uri http://localhost:8080/rooms/solo-alpha/symbols -Headers $headers
+```
+
+Buy from house liquidity:
+
+```powershell
+$body = @{ symbol = "NOVA"; quantity = 5 } | ConvertTo-Json
+Invoke-RestMethod -Method Post -Uri http://localhost:8080/rooms/solo-alpha/orders/market-buy -Headers $headers -ContentType "application/json" -Body $body
 ```
 
 Read the book:
 
 ```powershell
-curl.exe -s http://localhost:8080/book/BTC-USD
-```
-
-Read your fills:
-
-```powershell
-Invoke-RestMethod -Method Get -Uri http://localhost:8080/me/fills -Headers $buyerHeaders
+Invoke-RestMethod -Method Get -Uri http://localhost:8080/rooms/solo-alpha/book/NOVA -Headers $headers
 ```
 
 Read your portfolio estimate:
 
 ```powershell
-Invoke-RestMethod -Method Get -Uri http://localhost:8080/me/portfolio -Headers $buyerHeaders
+Invoke-RestMethod -Method Get -Uri http://localhost:8080/rooms/solo-alpha/me/portfolio -Headers $headers
 ```
 
 Cancel:
 
 ```powershell
-$body = @{ symbol = "BTC-USD"; orderId = $sell.orderId } | ConvertTo-Json
-Invoke-RestMethod -Method Post -Uri http://localhost:8080/orders/cancel -Headers $sellerHeaders -ContentType "application/json" -Body $body
+$order = @{ symbol = "NOVA"; price = 95; quantity = 1 } | ConvertTo-Json
+$buy = Invoke-RestMethod -Method Post -Uri http://localhost:8080/rooms/solo-alpha/orders/buy -Headers $headers -ContentType "application/json" -Body $order
+$body = @{ symbol = "NOVA"; orderId = $buy.orderId } | ConvertTo-Json
+Invoke-RestMethod -Method Post -Uri http://localhost:8080/rooms/solo-alpha/orders/cancel -Headers $headers -ContentType "application/json" -Body $body
 ```

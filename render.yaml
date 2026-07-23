@@ -7,3 +7,20 @@ services:
     dockerContext: .
     healthCheckPath: /health
     autoDeployTrigger: commit
+    envVars:
+      - key: DATABASE_URL
+        fromDatabase:
+          name: orderbook-db
+          property: connectionString
+      - key: ORDERBOOK_START_DELAY_SECONDS
+        value: "90"
+      - key: ORDERBOOK_GAME_DURATION_SECONDS
+        value: "600"
+      - key: ORDERBOOK_REJOIN_COOLDOWN_SECONDS
+        value: "60"
+      - key: ORDERBOOK_STARTING_CASH
+        value: "100000"
+
+databases:
+  - name: orderbook-db
+    plan: free

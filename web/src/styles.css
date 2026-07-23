@@ -441,7 +441,7 @@ label {
   border-bottom: 1px solid #edf1f5;
   display: grid;
   gap: 1px;
-  grid-template-columns: repeat(6, minmax(0, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
   margin: -4px 0 14px;
 }
 
@@ -538,6 +538,11 @@ label {
   color: #b64236;
 }
 
+.side-chip.neutral {
+  background: #eef2f6;
+  color: #526176;
+}
+
 .side-chip.buy {
   background: #e9f8ef;
 }
@@ -579,6 +584,18 @@ label {
 .empty-state {
   color: #8a97a8;
   padding: 16px;
+  text-align: center;
+}
+
+.locked-state {
+  align-items: center;
+  border: 1px dashed #c8d0dc;
+  border-radius: 8px;
+  color: #66758b;
+  display: flex;
+  justify-content: center;
+  min-height: 360px;
+  padding: 18px;
   text-align: center;
 }
 

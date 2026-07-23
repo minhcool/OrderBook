@@ -3,6 +3,9 @@ import type {
   FillRecord,
   GameLobby,
   GameRoom,
+  JoinResult,
+  LeaderboardRow,
+  LeaveResult,
   LobbyMembership,
   MarketScope,
   MarketPrice,
@@ -14,6 +17,7 @@ import type {
   PortfolioRecord,
   PositionRecord,
   ReplaceOrderRequest,
+  SessionSummary,
   Side,
   SubmitResult
 } from "./types";
@@ -72,21 +76,49 @@ export async function fetchLobbies(apiBase: string, roomId?: string): Promise<Ga
   return data.lobbies;
 }
 
-export async function fetchLobbyMembership(apiBase: string, lobbyId: string, token: string): Promise<LobbyMembership> {
-  return requestJson(`${apiBase}/lobbies/${encodeURIComponent(lobbyId)}/membership`, {
+export async function fetchActiveSession(apiBase: string, token: string): Promise<SessionSummary> {
+  return requestJson(`${apiBase}/me/session`, {
     headers: authHeaders(token)
   });
 }
 
-export async function joinLobby(apiBase: string, lobbyId: string, token: string): Promise<{ joined: boolean; lobby: GameLobby }> {
-  return requestJson(`${apiBase}/lobbies/${encodeURIComponent(lobbyId)}/join`, {
+export async function fetchRoomMembership(apiBase: string, roomId: string, token: string): Promise<LobbyMembership> {
+  return requestJson(`${apiBase}/rooms/${encodeURIComponent(roomId)}/membership`, {
+    headers: authHeaders(token)
+  });
+}
+
+export async function joinRoom(apiBase: string, roomId: string, token: string): Promise<JoinResult> {
+  return requestJson(`${apiBase}/rooms/${encodeURIComponent(roomId)}/join`, {
     method: "POST",
     headers: authHeaders(token),
     body: "{}"
   });
 }
 
-export async function leaveLobby(apiBase: string, lobbyId: string, token: string): Promise<{ left: boolean; lobby: GameLobby }> {
+export async function leaveRoom(apiBase: string, roomId: string, token: string): Promise<LeaveResult> {
+  return requestJson(`${apiBase}/rooms/${encodeURIComponent(roomId)}/leave`, {
+    method: "POST",
+    headers: authHeaders(token),
+    body: "{}"
+  });
+}
+
+export async function fetchLobbyMembership(apiBase: string, lobbyId: string, token: string): Promise<LobbyMembership> {
+  return requestJson(`${apiBase}/lobbies/${encodeURIComponent(lobbyId)}/membership`, {
+    headers: authHeaders(token)
+  });
+}
+
+export async function joinLobby(apiBase: string, lobbyId: string, token: string): Promise<JoinResult> {
+  return requestJson(`${apiBase}/lobbies/${encodeURIComponent(lobbyId)}/join`, {
+    method: "POST",
+    headers: authHeaders(token),
+    body: JSON.stringify({ track: "manual" })
+  });
+}
+
+export async function leaveLobby(apiBase: string, lobbyId: string, token: string): Promise<LeaveResult> {
   return requestJson(`${apiBase}/lobbies/${encodeURIComponent(lobbyId)}/leave`, {
     method: "POST",
     headers: authHeaders(token),
@@ -117,6 +149,14 @@ export async function fetchMarketTrades(
     `${scopedBase(apiBase, scope)}/trades/${encodeURIComponent(symbol)}?limit=${limit}`
   );
   return data.trades;
+}
+
+export async function fetchLeaderboard(apiBase: string, lobbyId: string, token: string): Promise<LeaderboardRow[]> {
+  const data = await requestJson<{ leaderboard: LeaderboardRow[] }>(
+    `${apiBase}/lobbies/${encodeURIComponent(lobbyId)}/leaderboard`,
+    { headers: authHeaders(token) }
+  );
+  return data.leaderboard;
 }
 
 function endpointFor(side: Side, mode: OrderMode): string {
