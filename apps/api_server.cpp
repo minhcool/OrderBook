@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <exception>
+#include <iomanip>
 #include <iostream>
 #include <map>
 #include <mutex>
@@ -93,6 +94,48 @@ struct PositionRecord {
     std::int64_t quoteCashFlow = 0;
     Qty boughtQuantity = 0;
     Qty soldQuantity = 0;
+    double averageEntryPrice = 0.0;
+};
+
+struct MarketTradeRecord {
+    std::uint64_t sequence = 0;
+    std::string symbol;
+    OrderId takerId = 0;
+    OrderId makerId = 0;
+    TraderId takerTraderId = 0;
+    TraderId makerTraderId = 0;
+    Side takerSide = Side::Buy;
+    Price price = 0;
+    Qty quantity = 0;
+    std::int64_t notional = 0;
+};
+
+struct PriceRecord {
+    std::string symbol;
+    std::size_t tradeCount = 0;
+    bool hasPrice = false;
+    Price lastPrice = 0;
+    double averagePrice3 = 0.0;
+    double averagePrice5 = 0.0;
+    double averagePrice10 = 0.0;
+};
+
+struct PortfolioPositionRecord {
+    PositionRecord position;
+    bool hasMark = false;
+    double markPrice = 0.0;
+    double marketValue = 0.0;
+    double costBasisValue = 0.0;
+    double unrealizedPnl = 0.0;
+};
+
+struct PortfolioRecord {
+    TraderId traderId = 0;
+    std::int64_t cashFlow = 0;
+    double marketValue = 0.0;
+    double estimatedValue = 0.0;
+    double unrealizedPnl = 0.0;
+    std::vector<PortfolioPositionRecord> positions;
 };
 
 class AccountStore {
@@ -101,6 +144,8 @@ public:
         std::lock_guard<std::mutex> lock(accountMutex);
 
         for (const Trade& trade : result.trades) {
+            appendMarketTrade(symbol, trade);
+
             appendFill(
                 symbol,
                 trade.takerId,
@@ -125,6 +170,41 @@ public:
         }
     }
 
+    std::vector<MarketTradeRecord> tradesForSymbol(const std::string& symbol, std::size_t limit) const {
+        std::lock_guard<std::mutex> lock(accountMutex);
+
+        std::vector<MarketTradeRecord> result;
+        for (auto it = marketTrades.rbegin(); it != marketTrades.rend(); ++it) {
+            if (it->symbol != symbol) {
+                continue;
+            }
+
+            result.push_back(*it);
+            if (result.size() >= limit) {
+                break;
+            }
+        }
+
+        return result;
+    }
+
+    PriceRecord priceForSymbol(const std::string& symbol) const {
+        std::lock_guard<std::mutex> lock(accountMutex);
+        return priceForSymbolLocked(symbol);
+    }
+
+    std::vector<PriceRecord> pricesForSymbols(const std::vector<std::string>& symbols) const {
+        std::lock_guard<std::mutex> lock(accountMutex);
+
+        std::vector<PriceRecord> result;
+        result.reserve(symbols.size());
+        for (const std::string& symbol : symbols) {
+            result.push_back(priceForSymbolLocked(symbol));
+        }
+
+        return result;
+    }
+
     std::vector<FillRecord> fillsForTrader(TraderId traderId) const {
         std::lock_guard<std::mutex> lock(accountMutex);
 
@@ -143,8 +223,104 @@ public:
 
     std::vector<PositionRecord> positionsForTrader(TraderId traderId) const {
         std::lock_guard<std::mutex> lock(accountMutex);
+        return positionsForTraderLocked(traderId);
+    }
 
+    PortfolioRecord portfolioForTrader(TraderId traderId) const {
+        std::lock_guard<std::mutex> lock(accountMutex);
+
+        PortfolioRecord portfolio;
+        portfolio.traderId = traderId;
+        const std::vector<PositionRecord> positions = positionsForTraderLocked(traderId);
+        portfolio.positions.reserve(positions.size());
+
+        for (const PositionRecord& position : positions) {
+            PortfolioPositionRecord marked;
+            marked.position = position;
+
+            portfolio.cashFlow += position.quoteCashFlow;
+
+            const PriceRecord price = priceForSymbolLocked(position.symbol);
+            if (price.hasPrice) {
+                marked.hasMark = true;
+                marked.markPrice = static_cast<double>(price.lastPrice);
+                marked.marketValue = static_cast<double>(position.quantity) * marked.markPrice;
+                marked.costBasisValue = static_cast<double>(position.quantity) * position.averageEntryPrice;
+                marked.unrealizedPnl = marked.marketValue - marked.costBasisValue;
+
+                portfolio.marketValue += marked.marketValue;
+                portfolio.unrealizedPnl += marked.unrealizedPnl;
+            }
+
+            portfolio.positions.push_back(marked);
+        }
+
+        portfolio.estimatedValue = static_cast<double>(portfolio.cashFlow) + portfolio.marketValue;
+        return portfolio;
+    }
+
+private:
+    struct MutablePosition {
+        PositionRecord record;
+        Qty openQuantity = 0;
+        double averageEntryPrice = 0.0;
+    };
+
+    static Side opposite(Side side) {
+        return side == Side::Buy ? Side::Sell : Side::Buy;
+    }
+
+    static double vwapFromLatest(const std::vector<MarketTradeRecord>& trades, const std::string& symbol, std::size_t count) {
+        std::int64_t notional = 0;
+        Qty quantity = 0;
+        std::size_t seen = 0;
+
+        for (auto it = trades.rbegin(); it != trades.rend() && seen < count; ++it) {
+            if (it->symbol != symbol) {
+                continue;
+            }
+
+            notional += it->notional;
+            quantity += it->quantity;
+            ++seen;
+        }
+
+        if (quantity == 0) {
+            return 0.0;
+        }
+
+        return static_cast<double>(notional) / static_cast<double>(quantity);
+    }
+
+    PriceRecord priceForSymbolLocked(const std::string& symbol) const {
+        PriceRecord price;
+        price.symbol = symbol;
+
+        for (auto it = marketTrades.rbegin(); it != marketTrades.rend(); ++it) {
+            if (it->symbol != symbol) {
+                continue;
+            }
+
+            if (!price.hasPrice) {
+                price.hasPrice = true;
+                price.lastPrice = it->price;
+            }
+
+            ++price.tradeCount;
+        }
+
+        if (price.hasPrice) {
+            price.averagePrice3 = vwapFromLatest(marketTrades, symbol, 3);
+            price.averagePrice5 = vwapFromLatest(marketTrades, symbol, 5);
+            price.averagePrice10 = vwapFromLatest(marketTrades, symbol, 10);
+        }
+
+        return price;
+    }
+
+    std::vector<PositionRecord> positionsForTraderLocked(TraderId traderId) const {
         std::map<std::string, PositionRecord> bySymbol;
+        std::map<std::string, MutablePosition> openPositions;
         for (const FillRecord& fill : fills) {
             if (fill.traderId != traderId) {
                 continue;
@@ -162,21 +338,74 @@ public:
                 position.quoteCashFlow += fill.notional;
                 position.soldQuantity += fill.quantity;
             }
+
+            applyEntryPrice(openPositions[fill.symbol], fill);
         }
 
         std::vector<PositionRecord> result;
         result.reserve(bySymbol.size());
         for (const auto& [symbol, position] : bySymbol) {
-            (void)symbol;
-            result.push_back(position);
+            PositionRecord enriched = position;
+            const auto openPosition = openPositions.find(symbol);
+            if (openPosition != openPositions.end()) {
+                enriched.averageEntryPrice = openPosition->second.averageEntryPrice;
+            }
+
+            result.push_back(enriched);
         }
 
         return result;
     }
 
-private:
-    static Side opposite(Side side) {
-        return side == Side::Buy ? Side::Sell : Side::Buy;
+    static void applyEntryPrice(MutablePosition& position, const FillRecord& fill) {
+        const Qty signedQuantity = fill.side == Side::Buy ? fill.quantity : -fill.quantity;
+        const double fillPrice = static_cast<double>(fill.price);
+
+        if (position.openQuantity == 0) {
+            position.openQuantity = signedQuantity;
+            position.averageEntryPrice = fillPrice;
+            return;
+        }
+
+        const bool sameDirection = (position.openQuantity > 0 && signedQuantity > 0)
+            || (position.openQuantity < 0 && signedQuantity < 0);
+        if (sameDirection) {
+            const double currentAbs = static_cast<double>(std::abs(position.openQuantity));
+            const double incomingAbs = static_cast<double>(std::abs(signedQuantity));
+            position.averageEntryPrice =
+                ((currentAbs * position.averageEntryPrice) + (incomingAbs * fillPrice)) / (currentAbs + incomingAbs);
+            position.openQuantity += signedQuantity;
+            return;
+        }
+
+        const Qty updatedQuantity = position.openQuantity + signedQuantity;
+        if (updatedQuantity == 0) {
+            position.openQuantity = 0;
+            position.averageEntryPrice = 0.0;
+            return;
+        }
+
+        const bool flippedDirection = (position.openQuantity > 0 && updatedQuantity < 0)
+            || (position.openQuantity < 0 && updatedQuantity > 0);
+        position.openQuantity = updatedQuantity;
+        if (flippedDirection) {
+            position.averageEntryPrice = fillPrice;
+        }
+    }
+
+    void appendMarketTrade(const std::string& symbol, const Trade& trade) {
+        marketTrades.push_back({
+            nextMarketSequence++,
+            symbol,
+            trade.takerId,
+            trade.makerId,
+            trade.takerTraderId,
+            trade.makerTraderId,
+            trade.takerSide,
+            trade.price,
+            trade.quantity,
+            trade.price * trade.quantity,
+        });
     }
 
     void appendFill(
@@ -190,7 +419,7 @@ private:
         Price price,
         Qty quantity) {
         fills.push_back({
-            nextSequence++,
+            nextFillSequence++,
             symbol,
             orderId,
             counterpartyOrderId,
@@ -205,8 +434,10 @@ private:
     }
 
     mutable std::mutex accountMutex;
-    std::uint64_t nextSequence = 1;
+    std::uint64_t nextFillSequence = 1;
+    std::uint64_t nextMarketSequence = 1;
     std::vector<FillRecord> fills;
+    std::vector<MarketTradeRecord> marketTrades;
 };
 
 #ifdef _WIN32
@@ -309,6 +540,26 @@ std::string jsonEscape(const std::string& value) {
     return out.str();
 }
 
+std::string jsonDouble(double value) {
+    if (value > -0.0000005 && value < 0.0000005) {
+        value = 0.0;
+    }
+
+    std::ostringstream out;
+    out << std::fixed << std::setprecision(6) << value;
+
+    std::string result = out.str();
+    while (result.size() > 1 && result.back() == '0') {
+        result.pop_back();
+    }
+
+    if (!result.empty() && result.back() == '.') {
+        result.push_back('0');
+    }
+
+    return result;
+}
+
 std::string sideToString(Side side) {
     return side == Side::Buy ? "buy" : "sell";
 }
@@ -407,6 +658,64 @@ std::string serializeSymbols(const std::vector<std::string>& symbols) {
     return out.str();
 }
 
+std::string serializePrice(const PriceRecord& price) {
+    std::ostringstream out;
+    out << "{"
+        << "\"symbol\":\"" << jsonEscape(price.symbol) << "\","
+        << "\"tradeCount\":" << price.tradeCount << ","
+        << "\"hasPrice\":" << (price.hasPrice ? "true" : "false") << ","
+        << "\"lastPrice\":" << price.lastPrice << ","
+        << "\"averagePrice3\":" << jsonDouble(price.averagePrice3) << ","
+        << "\"averagePrice5\":" << jsonDouble(price.averagePrice5) << ","
+        << "\"averagePrice10\":" << jsonDouble(price.averagePrice10)
+        << "}";
+    return out.str();
+}
+
+std::string serializePrices(const std::vector<PriceRecord>& prices) {
+    std::ostringstream out;
+    out << "{\"prices\":[";
+
+    for (std::size_t i = 0; i < prices.size(); ++i) {
+        if (i > 0) {
+            out << ",";
+        }
+
+        out << serializePrice(prices[i]);
+    }
+
+    out << "]}";
+    return out.str();
+}
+
+std::string serializeMarketTrades(const std::vector<MarketTradeRecord>& trades) {
+    std::ostringstream out;
+    out << "{\"trades\":[";
+
+    for (std::size_t i = 0; i < trades.size(); ++i) {
+        if (i > 0) {
+            out << ",";
+        }
+
+        const MarketTradeRecord& trade = trades[i];
+        out << "{"
+            << "\"sequence\":" << trade.sequence << ","
+            << "\"symbol\":\"" << jsonEscape(trade.symbol) << "\","
+            << "\"takerId\":" << trade.takerId << ","
+            << "\"makerId\":" << trade.makerId << ","
+            << "\"takerTraderId\":" << trade.takerTraderId << ","
+            << "\"makerTraderId\":" << trade.makerTraderId << ","
+            << "\"takerSide\":\"" << sideToString(trade.takerSide) << "\","
+            << "\"price\":" << trade.price << ","
+            << "\"quantity\":" << trade.quantity << ","
+            << "\"notional\":" << trade.notional
+            << "}";
+    }
+
+    out << "]}";
+    return out.str();
+}
+
 struct SymbolOpenOrder {
     std::string symbol;
     OpenOrder order;
@@ -494,8 +803,50 @@ std::string serializePositions(const std::vector<PositionRecord>& positions) {
             << "\"quantity\":" << position.quantity << ","
             << "\"quoteCashFlow\":" << position.quoteCashFlow << ","
             << "\"boughtQuantity\":" << position.boughtQuantity << ","
-            << "\"soldQuantity\":" << position.soldQuantity
+            << "\"soldQuantity\":" << position.soldQuantity << ","
+            << "\"averageEntryPrice\":" << jsonDouble(position.averageEntryPrice)
             << "}";
+    }
+
+    out << "]}";
+    return out.str();
+}
+
+std::string serializePortfolioPosition(const PortfolioPositionRecord& item) {
+    const PositionRecord& position = item.position;
+    std::ostringstream out;
+    out << "{"
+        << "\"symbol\":\"" << jsonEscape(position.symbol) << "\","
+        << "\"quantity\":" << position.quantity << ","
+        << "\"quoteCashFlow\":" << position.quoteCashFlow << ","
+        << "\"boughtQuantity\":" << position.boughtQuantity << ","
+        << "\"soldQuantity\":" << position.soldQuantity << ","
+        << "\"averageEntryPrice\":" << jsonDouble(position.averageEntryPrice) << ","
+        << "\"hasMark\":" << (item.hasMark ? "true" : "false") << ","
+        << "\"markPrice\":" << jsonDouble(item.markPrice) << ","
+        << "\"marketValue\":" << jsonDouble(item.marketValue) << ","
+        << "\"costBasisValue\":" << jsonDouble(item.costBasisValue) << ","
+        << "\"unrealizedPnl\":" << jsonDouble(item.unrealizedPnl)
+        << "}";
+    return out.str();
+}
+
+std::string serializePortfolio(const PortfolioRecord& portfolio) {
+    std::ostringstream out;
+    out << "{"
+        << "\"traderId\":" << portfolio.traderId << ","
+        << "\"cashFlow\":" << portfolio.cashFlow << ","
+        << "\"marketValue\":" << jsonDouble(portfolio.marketValue) << ","
+        << "\"estimatedValue\":" << jsonDouble(portfolio.estimatedValue) << ","
+        << "\"unrealizedPnl\":" << jsonDouble(portfolio.unrealizedPnl) << ","
+        << "\"positions\":[";
+
+    for (std::size_t i = 0; i < portfolio.positions.size(); ++i) {
+        if (i > 0) {
+            out << ",";
+        }
+
+        out << serializePortfolioPosition(portfolio.positions[i]);
     }
 
     out << "]}";
@@ -764,8 +1115,19 @@ std::size_t parseDepth(const std::string& query) {
     return static_cast<std::size_t>(std::stoull(match[1].str()));
 }
 
-std::optional<std::string> symbolFromBookPath(const std::string& path) {
-    const std::string prefix = "/book/";
+std::size_t parseLimit(const std::string& query, std::size_t defaultLimit = 25, std::size_t maxLimit = 200) {
+    const std::regex pattern("(^|&)limit=([0-9]+)(&|$)");
+    std::smatch match;
+
+    if (!std::regex_search(query, match, pattern)) {
+        return defaultLimit;
+    }
+
+    const std::size_t limit = static_cast<std::size_t>(std::stoull(match[2].str()));
+    return std::max<std::size_t>(1, std::min(limit, maxLimit));
+}
+
+std::optional<std::string> symbolFromPrefixedPath(const std::string& path, const std::string& prefix) {
     if (path.rfind(prefix, 0) != 0 || path.size() <= prefix.size()) {
         return std::nullopt;
     }
@@ -803,6 +1165,10 @@ HttpResponse handleGetMe(Exchange& exchange, AccountStore& accounts, const std::
 
         if (path == "/me/positions") {
             return jsonResponse(200, serializePositions(accounts.positionsForTrader(traderId)));
+        }
+
+        if (path == "/me/portfolio") {
+            return jsonResponse(200, serializePortfolio(accounts.portfolioForTrader(traderId)));
         }
     } catch (const AuthError& ex) {
         return jsonResponse(401, jsonError(ex.what()));
@@ -927,13 +1293,27 @@ HttpResponse route(Exchange& exchange, AccountStore& accounts, OrderIdGenerator&
             return jsonResponse(200, serializeSymbols(exchange.symbols()));
         }
 
-        const std::optional<std::string> symbol = symbolFromBookPath(path);
+        if (path == "/prices") {
+            return jsonResponse(200, serializePrices(accounts.pricesForSymbols(exchange.symbols())));
+        }
+
+        const std::optional<std::string> priceSymbol = symbolFromPrefixedPath(path, "/prices/");
+        if (priceSymbol) {
+            return jsonResponse(200, serializePrice(accounts.priceForSymbol(*priceSymbol)));
+        }
+
+        const std::optional<std::string> tradesSymbol = symbolFromPrefixedPath(path, "/trades/");
+        if (tradesSymbol) {
+            return jsonResponse(200, serializeMarketTrades(accounts.tradesForSymbol(*tradesSymbol, parseLimit(query))));
+        }
+
+        const std::optional<std::string> symbol = symbolFromPrefixedPath(path, "/book/");
         if (symbol) {
             return jsonResponse(200, serializeSnapshot(*symbol, exchange.snapshot(*symbol, parseDepth(query))));
         }
 
         if (path == "/me" || path == "/me/orders" || path == "/me/fills" || path == "/me/trades"
-            || path == "/me/positions") {
+            || path == "/me/positions" || path == "/me/portfolio") {
             return handleGetMe(exchange, accounts, path, request);
         }
 

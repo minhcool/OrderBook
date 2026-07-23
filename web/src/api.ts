@@ -1,10 +1,13 @@
 import type {
   BookSnapshot,
   FillRecord,
+  MarketPrice,
+  MarketTradeRecord,
   MeSummary,
   NewOrderRequest,
   OpenOrder,
   OrderMode,
+  PortfolioRecord,
   PositionRecord,
   ReplaceOrderRequest,
   Side,
@@ -51,6 +54,17 @@ export async function fetchSymbols(apiBase: string): Promise<string[]> {
 
 export async function fetchBook(apiBase: string, symbol: string, depth: number): Promise<BookSnapshot> {
   return requestJson(`${apiBase}/book/${encodeURIComponent(symbol)}?depth=${depth}`);
+}
+
+export async function fetchPrice(apiBase: string, symbol: string): Promise<MarketPrice> {
+  return requestJson(`${apiBase}/prices/${encodeURIComponent(symbol)}`);
+}
+
+export async function fetchMarketTrades(apiBase: string, symbol: string, limit = 25): Promise<MarketTradeRecord[]> {
+  const data = await requestJson<{ trades: MarketTradeRecord[] }>(
+    `${apiBase}/trades/${encodeURIComponent(symbol)}?limit=${limit}`
+  );
+  return data.trades;
 }
 
 function endpointFor(side: Side, mode: OrderMode): string {
@@ -126,4 +140,10 @@ export async function fetchPositions(apiBase: string, token: string): Promise<Po
     headers: authHeaders(token)
   });
   return data.positions;
+}
+
+export async function fetchPortfolio(apiBase: string, token: string): Promise<PortfolioRecord> {
+  return requestJson(`${apiBase}/me/portfolio`, {
+    headers: authHeaders(token)
+  });
 }

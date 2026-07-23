@@ -195,7 +195,7 @@ label {
 .market-strip {
   display: grid;
   gap: 1px;
-  grid-template-columns: repeat(4, 1fr);
+  grid-template-columns: repeat(6, 1fr);
   overflow: hidden;
 }
 
@@ -402,7 +402,7 @@ label {
   border-bottom: 1px solid #edf1f5;
   display: grid;
   gap: 1px;
-  grid-template-columns: repeat(4, 1fr);
+  grid-template-columns: repeat(6, minmax(0, 1fr));
   margin: -4px 0 14px;
 }
 

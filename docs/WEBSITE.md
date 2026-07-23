@@ -6,7 +6,7 @@ Authentication is handled by Clerk. Signed-in users can submit, replace, and can
 
 New order IDs are assigned by the API server. The website shows returned IDs in activity and uses them for replace/cancel actions.
 
-Signed-in users can also see their account panel: current open orders, recent fills/trades, and positions derived from those fills.
+Signed-in users can also see their account panel: current open orders, recent fills/trades, positions derived from those fills, cash flow, marked market value, estimated value, and unrealized PnL.
 
 ## Local Run
 
@@ -82,9 +82,18 @@ GET /me
 GET /me/orders
 GET /me/fills
 GET /me/positions
+GET /me/portfolio
 ```
 
-This data is currently in memory on the C++ API server. It is enough to test a real user flow, but it is not durable yet: restarting or redeploying the API clears the books, fills, and derived positions.
+The market strip reads:
+
+```text
+GET /prices/{symbol}
+```
+
+This data is currently in memory on the C++ API server. It is enough to test a real user flow, but it is not durable yet: restarting or redeploying the API clears the books, trade tape, fills, derived positions, and portfolio marks.
+
+Portfolio value is estimated from trade cash flow and last-trade marks. It is not a real account balance yet because deposits, withdrawals, reserves, and starting balances are not implemented.
 
 ## Clerk Setup
 

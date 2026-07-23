@@ -61,6 +61,47 @@ export interface PositionRecord {
   quoteCashFlow: number;
   boughtQuantity: number;
   soldQuantity: number;
+  averageEntryPrice: number;
+}
+
+export interface MarketPrice {
+  symbol: string;
+  tradeCount: number;
+  hasPrice: boolean;
+  lastPrice: number;
+  averagePrice3: number;
+  averagePrice5: number;
+  averagePrice10: number;
+}
+
+export interface MarketTradeRecord {
+  sequence: number;
+  symbol: string;
+  takerId: number;
+  makerId: number;
+  takerTraderId: number;
+  makerTraderId: number;
+  takerSide: Side;
+  price: number;
+  quantity: number;
+  notional: number;
+}
+
+export interface PortfolioPositionRecord extends PositionRecord {
+  hasMark: boolean;
+  markPrice: number;
+  marketValue: number;
+  costBasisValue: number;
+  unrealizedPnl: number;
+}
+
+export interface PortfolioRecord {
+  traderId: number;
+  cashFlow: number;
+  marketValue: number;
+  estimatedValue: number;
+  unrealizedPnl: number;
+  positions: PortfolioPositionRecord[];
 }
 
 export interface MeSummary {

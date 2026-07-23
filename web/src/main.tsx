@@ -9,13 +9,14 @@ import {
   fetchFills,
   fetchMe,
   fetchOpenOrders,
-  fetchPositions,
+  fetchPortfolio,
+  fetchPrice,
   fetchSymbols,
   health,
   replaceOrder,
   submitOrder
 } from "./api";
-import type { BookSnapshot, FillRecord, MeSummary, OpenOrder, OrderMode, PositionRecord, Side, SubmitResult } from "./types";
+import type { BookSnapshot, FillRecord, MarketPrice, MeSummary, OpenOrder, OrderMode, PortfolioRecord, Side, SubmitResult } from "./types";
 import "./styles.css";
 
 const DEFAULT_API_BASE = import.meta.env.VITE_ORDERBOOK_API_URL ?? "http://localhost:8080";
@@ -62,13 +63,14 @@ function App() {
   const [symbol, setSymbol] = React.useState(DEFAULT_SYMBOL);
   const [symbols, setSymbols] = React.useState<string[]>([]);
   const [book, setBook] = React.useState<BookSnapshot>({ symbol: DEFAULT_SYMBOL, bids: [], asks: [] });
+  const [marketPrice, setMarketPrice] = React.useState<MarketPrice | null>(null);
   const [apiOnline, setApiOnline] = React.useState(false);
   const [loading, setLoading] = React.useState(false);
   const [activity, setActivity] = React.useState<ActivityItem[]>([]);
   const [me, setMe] = React.useState<MeSummary | null>(null);
   const [openOrders, setOpenOrders] = React.useState<OpenOrder[]>([]);
   const [fills, setFills] = React.useState<FillRecord[]>([]);
-  const [positions, setPositions] = React.useState<PositionRecord[]>([]);
+  const [portfolio, setPortfolio] = React.useState<PortfolioRecord | null>(null);
 
   const [side, setSide] = React.useState<Side>("buy");
   const [mode, setMode] = React.useState<OrderMode>("limit");
@@ -104,13 +106,15 @@ function App() {
 
     try {
       await health(apiBase);
-      const [nextBook, nextSymbols] = await Promise.all([
+      const [nextBook, nextSymbols, nextMarketPrice] = await Promise.all([
         fetchBook(apiBase, symbol, 10),
-        fetchSymbols(apiBase)
+        fetchSymbols(apiBase),
+        fetchPrice(apiBase, symbol)
       ]);
 
       setBook(nextBook);
       setSymbols(nextSymbols);
+      setMarketPrice(nextMarketPrice);
       setApiOnline(true);
     } catch (error) {
       setApiOnline(false);
@@ -125,7 +129,7 @@ function App() {
       setMe(null);
       setOpenOrders([]);
       setFills([]);
-      setPositions([]);
+      setPortfolio(null);
       return;
     }
 
@@ -135,17 +139,17 @@ function App() {
         throw new Error("Could not read Clerk session token");
       }
 
-      const [nextMe, nextOpenOrders, nextFills, nextPositions] = await Promise.all([
+      const [nextMe, nextOpenOrders, nextFills, nextPortfolio] = await Promise.all([
         fetchMe(apiBase, token),
         fetchOpenOrders(apiBase, token),
         fetchFills(apiBase, token),
-        fetchPositions(apiBase, token)
+        fetchPortfolio(apiBase, token)
       ]);
 
       setMe(nextMe);
       setOpenOrders(nextOpenOrders);
       setFills(nextFills);
-      setPositions(nextPositions);
+      setPortfolio(nextPortfolio);
     } catch (error) {
       pushActivity("Account refresh failed", error instanceof Error ? error.message : "Request failed", false);
     }
@@ -279,6 +283,8 @@ function App() {
         <Metric label="Best bid" value={book.bids[0] ? formatNumber(book.bids[0].price) : "-"} />
         <Metric label="Best ask" value={book.asks[0] ? formatNumber(book.asks[0].price) : "-"} />
         <Metric label="Spread" value={spread === null ? "-" : formatNumber(spread)} />
+        <Metric label="Last trade" value={marketPrice?.hasPrice ? formatNumber(marketPrice.lastPrice) : "-"} />
+        <Metric label="VWAP 5" value={marketPrice?.hasPrice ? formatNumber(marketPrice.averagePrice5) : "-"} />
         <Metric label="Depth" value={`${book.bids.length}/${book.asks.length}`} />
       </section>
 
@@ -405,7 +411,7 @@ function App() {
           me={me}
           openOrders={openOrders}
           fills={fills}
-          positions={positions}
+          portfolio={portfolio}
           isSignedIn={Boolean(isSignedIn)}
           onRefresh={() => void refreshAccount()}
         />
@@ -451,17 +457,19 @@ function AccountPanel({
   me,
   openOrders,
   fills,
-  positions,
+  portfolio,
   isSignedIn,
   onRefresh
 }: {
   me: MeSummary | null;
   openOrders: OpenOrder[];
   fills: FillRecord[];
-  positions: PositionRecord[];
+  portfolio: PortfolioRecord | null;
   isSignedIn: boolean;
   onRefresh: () => void;
 }) {
+  const positions = portfolio?.positions ?? [];
+
   return (
     <section className="panel account-panel">
       <div className="panel-title">
@@ -483,6 +491,20 @@ function AccountPanel({
             <div className="account-stat">
               <span>Trader ID</span>
               <strong>{me ? formatNumber(me.traderId) : "-"}</strong>
+            </div>
+            <div className="account-stat">
+              <span>Cash Flow</span>
+              <strong>{portfolio ? formatSignedNumber(portfolio.cashFlow) : "-"}</strong>
+            </div>
+            <div className="account-stat">
+              <span>Market Value</span>
+              <strong>{portfolio ? formatSignedNumber(portfolio.marketValue) : "-"}</strong>
+            </div>
+            <div className="account-stat">
+              <span>Est. Value</span>
+              <strong className={portfolio && portfolio.estimatedValue < 0 ? "sell-text" : "buy-text"}>
+                {portfolio ? formatSignedNumber(portfolio.estimatedValue) : "-"}
+              </strong>
             </div>
             <div className="account-stat">
               <span>Open Orders</span>
@@ -507,13 +529,18 @@ function AccountPanel({
                   <div className="data-row" key={position.symbol}>
                     <div className="data-main">
                       <strong>{position.symbol}</strong>
-                      <span>Bought {formatNumber(position.boughtQuantity)} / sold {formatNumber(position.soldQuantity)}</span>
+                      <span>
+                        Avg {position.averageEntryPrice ? formatNumber(position.averageEntryPrice) : "-"} / mark{" "}
+                        {position.hasMark ? formatNumber(position.markPrice) : "-"}
+                      </span>
                     </div>
                     <div className="data-values">
                       <strong className={position.quantity >= 0 ? "buy-text" : "sell-text"}>
                         {formatSignedNumber(position.quantity)}
                       </strong>
-                      <span>Cash {formatSignedNumber(position.quoteCashFlow)}</span>
+                      <span className={position.unrealizedPnl >= 0 ? "buy-text" : "sell-text"}>
+                        PnL {position.hasMark ? formatSignedNumber(position.unrealizedPnl) : "-"}
+                      </span>
                     </div>
                   </div>
                 ))

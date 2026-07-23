@@ -31,6 +31,7 @@ Stop it with `Ctrl+C`.
 - The API server starts with empty `BTC-USD` and `ETH-USD` books.
 - New order IDs are assigned by the server. Clients pass `orderId` only when replacing or canceling an existing order.
 - Open orders, fills, and positions are also stored/read in memory.
+- Price marks are based on the public trade tape. The current portfolio mark uses the last trade price; `/prices` also exposes VWAPs over the last 3, 5, and 10 trades.
 - Request bodies are flat JSON objects.
 - The parser is intentionally tiny and only supports the fields shown here.
 - POST order endpoints and `/me` endpoints require `Authorization: Bearer <Clerk session token>`.
@@ -61,6 +62,59 @@ Response:
 
 ```json
 { "symbols": ["BTC-USD", "ETH-USD"] }
+```
+
+Market prices:
+
+```http
+GET /prices
+GET /prices/{symbol}
+```
+
+Response:
+
+```json
+{
+  "symbol": "BTC-USD",
+  "tradeCount": 3,
+  "hasPrice": true,
+  "lastPrice": 105,
+  "averagePrice3": 101.166667,
+  "averagePrice5": 101.166667,
+  "averagePrice10": 101.166667
+}
+```
+
+`GET /prices` returns the same objects inside `{ "prices": [...] }`.
+
+`averagePrice3`, `averagePrice5`, and `averagePrice10` are volume-weighted averages from the latest trades for that symbol.
+
+Recent market trades:
+
+```http
+GET /trades/{symbol}
+GET /trades/{symbol}?limit=50
+```
+
+Response:
+
+```json
+{
+  "trades": [
+    {
+      "sequence": 3,
+      "symbol": "BTC-USD",
+      "takerId": 202,
+      "makerId": 201,
+      "takerTraderId": 2,
+      "makerTraderId": 1,
+      "takerSide": "buy",
+      "price": 105,
+      "quantity": 1,
+      "notional": 105
+    }
+  ]
+}
 ```
 
 Book snapshot:
@@ -173,7 +227,48 @@ Response:
       "quantity": 3,
       "quoteCashFlow": -300,
       "boughtQuantity": 3,
-      "soldQuantity": 0
+      "soldQuantity": 0,
+      "averageEntryPrice": 100
+    }
+  ]
+}
+```
+
+Authenticated portfolio:
+
+```http
+GET /me/portfolio
+Authorization: Bearer <Clerk session token>
+```
+
+`cashFlow` is quote currency received/spent from fills only. Because deposits and starting balances do not exist yet, `estimatedValue` is the trading-derived estimate:
+
+```text
+cashFlow + sum(position quantity * last trade price)
+```
+
+Response:
+
+```json
+{
+  "traderId": 194214855,
+  "cashFlow": -607,
+  "marketValue": 630,
+  "estimatedValue": 23,
+  "unrealizedPnl": 23,
+  "positions": [
+    {
+      "symbol": "BTC-USD",
+      "quantity": 6,
+      "quoteCashFlow": -607,
+      "boughtQuantity": 6,
+      "soldQuantity": 0,
+      "averageEntryPrice": 101.166667,
+      "hasMark": true,
+      "markPrice": 105,
+      "marketValue": 630,
+      "costBasisValue": 607,
+      "unrealizedPnl": 23
     }
   ]
 }
@@ -351,6 +446,12 @@ Read your fills:
 
 ```powershell
 Invoke-RestMethod -Method Get -Uri http://localhost:8080/me/fills -Headers $buyerHeaders
+```
+
+Read your portfolio estimate:
+
+```powershell
+Invoke-RestMethod -Method Get -Uri http://localhost:8080/me/portfolio -Headers $buyerHeaders
 ```
 
 Cancel:
