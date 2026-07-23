@@ -205,6 +205,7 @@ Price orderbook::effectiveLimitPrice(const order& incoming, Type type) {
 
 SubmitResult orderbook::submitLocked(order incoming, Type type) {
     SubmitResult result;
+    result.orderId = incoming.getId();
 
     if (!validateIncoming(incoming, type, result)) {
         return result;
@@ -249,6 +250,7 @@ SubmitResult orderbook::submitLocked(order incoming, Type type) {
 
 SubmitResult orderbook::replaceLocked(order replacement, Type type) {
     SubmitResult result;
+    result.orderId = replacement.getId();
 
     if (!validateIncoming(replacement, type, result)) {
         return result;

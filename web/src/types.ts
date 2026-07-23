@@ -12,6 +12,7 @@ export interface Trade {
 }
 
 export interface SubmitResult {
+  orderId: number;
   accepted: boolean;
   filledQuantity: number;
   restingQuantity: number;
@@ -33,9 +34,15 @@ export interface BookSnapshot {
   asks: BookLevel[];
 }
 
-export interface OrderRequest {
+export interface NewOrderRequest {
+  symbol: string;
+  price?: number;
+  quantity: number;
+}
+
+export interface ReplaceOrderRequest {
   symbol: string;
   orderId: number;
-  price?: number;
+  price: number;
   quantity: number;
 }

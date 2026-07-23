@@ -1,4 +1,4 @@
-import type { BookSnapshot, OrderMode, OrderRequest, Side, SubmitResult } from "./types";
+import type { BookSnapshot, NewOrderRequest, OrderMode, ReplaceOrderRequest, Side, SubmitResult } from "./types";
 
 export class ApiError extends Error {
   constructor(message: string, public readonly status?: number) {
@@ -55,7 +55,7 @@ export async function submitOrder(
   token: string,
   side: Side,
   mode: OrderMode,
-  order: OrderRequest
+  order: NewOrderRequest
 ): Promise<SubmitResult> {
   return requestJson(`${apiBase}${endpointFor(side, mode)}`, {
     method: "POST",
@@ -68,7 +68,7 @@ export async function replaceOrder(
   apiBase: string,
   token: string,
   side: Side,
-  order: Required<OrderRequest>
+  order: ReplaceOrderRequest
 ): Promise<SubmitResult> {
   return requestJson(`${apiBase}/orders/replace-${side}`, {
     method: "POST",

@@ -14,6 +14,7 @@ void test_regular_matching_and_partial_rest() {
     orderbook book;
 
     SubmitResult sell1 = book.submit(makeOrder(1, 10, 100, 10, Side::Sell));
+    assert(sell1.orderId == 1);
     assert(sell1.accepted);
     assert(sell1.filledQuantity == 0);
     assert(sell1.restingQuantity == 10);
@@ -26,6 +27,7 @@ void test_regular_matching_and_partial_rest() {
     assert(book.bestBid() == 99);
 
     SubmitResult buy2 = book.submit(makeOrder(3, 30, 100, 7, Side::Buy));
+    assert(buy2.orderId == 3);
     assert(buy2.accepted);
     assert(buy2.filledQuantity == 7);
     assert(buy2.restingQuantity == 0);

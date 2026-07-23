@@ -29,6 +29,7 @@ Stop it with `Ctrl+C`.
 - Restarting the server clears all books.
 - One symbol maps to one orderbook.
 - The API server starts with empty `BTC-USD` and `ETH-USD` books.
+- New order IDs are assigned by the server. Clients pass `orderId` only when replacing or canceling an existing order.
 - Request bodies are flat JSON objects.
 - The parser is intentionally tiny and only supports the fields shown here.
 - POST order endpoints require `Authorization: Bearer <Clerk session token>`.
@@ -96,7 +97,6 @@ Body:
 ```json
 {
   "symbol": "BTC-USD",
-  "orderId": 101,
   "price": 100,
   "quantity": 5
 }
@@ -114,7 +114,6 @@ Body:
 ```json
 {
   "symbol": "BTC-USD",
-  "orderId": 102,
   "quantity": 5
 }
 ```
@@ -131,7 +130,6 @@ Body:
 ```json
 {
   "symbol": "BTC-USD",
-  "orderId": 103,
   "price": 100,
   "quantity": 5
 }
@@ -149,7 +147,6 @@ Body:
 ```json
 {
   "symbol": "BTC-USD",
-  "orderId": 104,
   "price": 100,
   "quantity": 5
 }
@@ -194,6 +191,7 @@ Most order endpoints return:
 
 ```json
 {
+  "orderId": 201,
   "accepted": true,
   "filledQuantity": 3,
   "restingQuantity": 0,
@@ -233,15 +231,16 @@ Place a sell:
 
 ```powershell
 $headers = @{ Authorization = "Bearer $env:CLERK_TOKEN" }
-$body = @{ symbol = "BTC-USD"; orderId = 101; price = 100; quantity = 5 } | ConvertTo-Json
-Invoke-RestMethod -Method Post -Uri http://localhost:8080/orders/sell -Headers $headers -ContentType "application/json" -Body $body
+$body = @{ symbol = "BTC-USD"; price = 100; quantity = 5 } | ConvertTo-Json
+$sell = Invoke-RestMethod -Method Post -Uri http://localhost:8080/orders/sell -Headers $headers -ContentType "application/json" -Body $body
+$sell.orderId
 ```
 
 Place a crossing buy:
 
 ```powershell
 $headers = @{ Authorization = "Bearer $env:CLERK_TOKEN" }
-$body = @{ symbol = "BTC-USD"; orderId = 201; price = 100; quantity = 3 } | ConvertTo-Json
+$body = @{ symbol = "BTC-USD"; price = 100; quantity = 3 } | ConvertTo-Json
 Invoke-RestMethod -Method Post -Uri http://localhost:8080/orders/buy -Headers $headers -ContentType "application/json" -Body $body
 ```
 
@@ -255,6 +254,6 @@ Cancel:
 
 ```powershell
 $headers = @{ Authorization = "Bearer $env:CLERK_TOKEN" }
-$body = @{ symbol = "BTC-USD"; orderId = 101 } | ConvertTo-Json
+$body = @{ symbol = "BTC-USD"; orderId = $sell.orderId } | ConvertTo-Json
 Invoke-RestMethod -Method Post -Uri http://localhost:8080/orders/cancel -Headers $headers -ContentType "application/json" -Body $body
 ```

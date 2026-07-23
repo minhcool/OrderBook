@@ -4,6 +4,8 @@ The website is a Vite/React app in `web/`. It is a browser UI for the local HTTP
 
 Authentication is handled by Clerk. Signed-in users can submit, replace, and cancel orders. The website sends a Clerk bearer token to the C++ API server.
 
+New order IDs are assigned by the API server. The website shows returned IDs in activity and uses them for replace/cancel actions.
+
 ## Local Run
 
 Terminal 1:

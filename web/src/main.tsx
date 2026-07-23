@@ -45,7 +45,6 @@ function App() {
 
   const [side, setSide] = React.useState<Side>("buy");
   const [mode, setMode] = React.useState<OrderMode>("limit");
-  const [orderId, setOrderId] = React.useState("1001");
   const [price, setPrice] = React.useState("100");
   const [quantity, setQuantity] = React.useState("5");
 
@@ -103,7 +102,6 @@ function App() {
 
     const payload = {
       symbol,
-      orderId: toNumber(orderId),
       quantity: toNumber(quantity),
       ...(mode === "market" ? {} : { price: toNumber(price) })
     };
@@ -111,8 +109,12 @@ function App() {
     try {
       const token = await requireToken();
       const result = await submitOrder(apiBase, token, side, mode, payload);
-      pushActivity(`${mode.toUpperCase()} ${side.toUpperCase()} #${payload.orderId}`, resultSummary(result), result.accepted);
-      setOrderId(String(toNumber(orderId) + 1));
+      pushActivity(`${mode.toUpperCase()} ${side.toUpperCase()} #${result.orderId}`, resultSummary(result), result.accepted);
+      if (result.accepted && result.restingQuantity > 0) {
+        setReplaceSide(side);
+        setReplaceOrderId(String(result.orderId));
+        setCancelId(String(result.orderId));
+      }
       await refresh();
     } catch (error) {
       pushActivity("Order rejected", error instanceof Error ? error.message : "Request failed", false);
@@ -249,10 +251,6 @@ function App() {
               { label: "IOC", value: "ioc" },
               { label: "FOK", value: "fok" }
             ]} />
-            <label>
-              Order ID
-              <input inputMode="numeric" value={orderId} onChange={(event) => setOrderId(event.target.value)} />
-            </label>
             <label>
               Price
               <input inputMode="numeric" value={price} disabled={mode === "market"} onChange={(event) => setPrice(event.target.value)} />

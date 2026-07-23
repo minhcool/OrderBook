@@ -1,6 +1,7 @@
 #include "orderbook/exchange.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <cstdint>
 #include <cstdlib>
@@ -50,6 +51,16 @@ class AuthError : public std::runtime_error {
 public:
     explicit AuthError(const std::string& message)
         : std::runtime_error(message) {}
+};
+
+class OrderIdGenerator {
+public:
+    OrderId next() {
+        return nextId.fetch_add(1, std::memory_order_relaxed);
+    }
+
+private:
+    std::atomic<OrderId> nextId{1};
 };
 
 struct ParsedOrder {
@@ -196,6 +207,7 @@ std::string serializeSubmitResult(const SubmitResult& result) {
     std::ostringstream out;
 
     out << "{"
+        << "\"orderId\":" << result.orderId << ","
         << "\"accepted\":" << (result.accepted ? "true" : "false") << ","
         << "\"filledQuantity\":" << result.filledQuantity << ","
         << "\"restingQuantity\":" << result.restingQuantity << ","
@@ -383,6 +395,50 @@ TraderId authenticatedTraderId(const HttpRequest& request) {
     return traderIdFromSubject(*subject);
 }
 
+void rejectClientOrderId(const std::string& body) {
+    if (jsonIntField(body, "orderId")) {
+        throw std::runtime_error("orderId is assigned by the server");
+    }
+}
+
+ParsedOrder parseNewOrderWithPrice(const std::string& body) {
+    rejectClientOrderId(body);
+
+    ParsedOrder order;
+
+    const auto symbol = jsonStringField(body, "symbol");
+    const auto price = jsonIntField(body, "price");
+    const auto quantity = jsonIntField(body, "quantity");
+
+    if (!symbol || !price || !quantity) {
+        throw std::runtime_error("expected symbol, price, and quantity");
+    }
+
+    order.symbol = *symbol;
+    order.price = *price;
+    order.quantity = *quantity;
+
+    return order;
+}
+
+ParsedOrder parseNewMarketOrder(const std::string& body) {
+    rejectClientOrderId(body);
+
+    ParsedOrder order;
+
+    const auto symbol = jsonStringField(body, "symbol");
+    const auto quantity = jsonIntField(body, "quantity");
+
+    if (!symbol || !quantity) {
+        throw std::runtime_error("expected symbol and quantity");
+    }
+
+    order.symbol = *symbol;
+    order.quantity = *quantity;
+
+    return order;
+}
+
 ParsedOrder parseOrderWithPrice(const std::string& body) {
     ParsedOrder order;
 
@@ -398,24 +454,6 @@ ParsedOrder parseOrderWithPrice(const std::string& body) {
     order.symbol = *symbol;
     order.orderId = *orderId;
     order.price = *price;
-    order.quantity = *quantity;
-
-    return order;
-}
-
-ParsedOrder parseMarketOrder(const std::string& body) {
-    ParsedOrder order;
-
-    const auto symbol = jsonStringField(body, "symbol");
-    const auto orderId = jsonIntField(body, "orderId");
-    const auto quantity = jsonIntField(body, "quantity");
-
-    if (!symbol || !orderId || !quantity) {
-        throw std::runtime_error("expected symbol, orderId, and quantity");
-    }
-
-    order.symbol = *symbol;
-    order.orderId = *orderId;
     order.quantity = *quantity;
 
     return order;
@@ -490,55 +528,63 @@ HttpResponse jsonResponse(int status, const std::string& body) {
     return {status, "application/json", body};
 }
 
-HttpResponse handlePostOrder(Exchange& exchange, const std::string& path, const HttpRequest& request) {
+HttpResponse handlePostOrder(Exchange& exchange, OrderIdGenerator& orderIds, const std::string& path, const HttpRequest& request) {
     try {
         const TraderId traderId = authenticatedTraderId(request);
         const std::string& body = request.body;
 
         if (path == "/orders/buy") {
-            const ParsedOrder order = parseOrderWithPrice(body);
+            ParsedOrder order = parseNewOrderWithPrice(body);
+            order.orderId = orderIds.next();
             return jsonResponse(200, serializeSubmitResult(
                 exchange.buy(order.symbol, traderId, order.orderId, order.price, order.quantity)));
         }
 
         if (path == "/orders/sell") {
-            const ParsedOrder order = parseOrderWithPrice(body);
+            ParsedOrder order = parseNewOrderWithPrice(body);
+            order.orderId = orderIds.next();
             return jsonResponse(200, serializeSubmitResult(
                 exchange.sell(order.symbol, traderId, order.orderId, order.price, order.quantity)));
         }
 
         if (path == "/orders/market-buy") {
-            const ParsedOrder order = parseMarketOrder(body);
+            ParsedOrder order = parseNewMarketOrder(body);
+            order.orderId = orderIds.next();
             return jsonResponse(200, serializeSubmitResult(
                 exchange.marketBuy(order.symbol, traderId, order.orderId, order.quantity)));
         }
 
         if (path == "/orders/market-sell") {
-            const ParsedOrder order = parseMarketOrder(body);
+            ParsedOrder order = parseNewMarketOrder(body);
+            order.orderId = orderIds.next();
             return jsonResponse(200, serializeSubmitResult(
                 exchange.marketSell(order.symbol, traderId, order.orderId, order.quantity)));
         }
 
         if (path == "/orders/ioc-buy") {
-            const ParsedOrder order = parseOrderWithPrice(body);
+            ParsedOrder order = parseNewOrderWithPrice(body);
+            order.orderId = orderIds.next();
             return jsonResponse(200, serializeSubmitResult(
                 exchange.iocBuy(order.symbol, traderId, order.orderId, order.price, order.quantity)));
         }
 
         if (path == "/orders/ioc-sell") {
-            const ParsedOrder order = parseOrderWithPrice(body);
+            ParsedOrder order = parseNewOrderWithPrice(body);
+            order.orderId = orderIds.next();
             return jsonResponse(200, serializeSubmitResult(
                 exchange.iocSell(order.symbol, traderId, order.orderId, order.price, order.quantity)));
         }
 
         if (path == "/orders/fok-buy") {
-            const ParsedOrder order = parseOrderWithPrice(body);
+            ParsedOrder order = parseNewOrderWithPrice(body);
+            order.orderId = orderIds.next();
             return jsonResponse(200, serializeSubmitResult(
                 exchange.fokBuy(order.symbol, traderId, order.orderId, order.price, order.quantity)));
         }
 
         if (path == "/orders/fok-sell") {
-            const ParsedOrder order = parseOrderWithPrice(body);
+            ParsedOrder order = parseNewOrderWithPrice(body);
+            order.orderId = orderIds.next();
             return jsonResponse(200, serializeSubmitResult(
                 exchange.fokSell(order.symbol, traderId, order.orderId, order.price, order.quantity)));
         }
@@ -575,7 +621,7 @@ HttpResponse handlePostOrder(Exchange& exchange, const std::string& path, const 
     return jsonResponse(404, jsonError("unknown POST endpoint"));
 }
 
-HttpResponse route(Exchange& exchange, const HttpRequest& request) {
+HttpResponse route(Exchange& exchange, OrderIdGenerator& orderIds, const HttpRequest& request) {
     const auto [path, query] = splitQuery(request.path);
 
     if (request.method == "OPTIONS") {
@@ -600,7 +646,7 @@ HttpResponse route(Exchange& exchange, const HttpRequest& request) {
     }
 
     if (request.method == "POST") {
-        return handlePostOrder(exchange, path, request);
+        return handlePostOrder(exchange, orderIds, path, request);
     }
 
     return jsonResponse(405, jsonError("only GET, POST, and OPTIONS are supported"));
@@ -753,6 +799,7 @@ int main(int argc, char** argv) {
         SocketRuntime runtime;
         SocketHandle server = createServerSocket(port);
         Exchange exchange;
+        OrderIdGenerator orderIds;
         seedDefaultBooks(exchange);
 
         std::cout << "Orderbook API server listening on 0.0.0.0:" << port << "\n";
@@ -768,7 +815,7 @@ int main(int argc, char** argv) {
 
             std::optional<HttpRequest> request = readRequest(client);
             if (request) {
-                sendResponse(client, route(exchange, *request));
+                sendResponse(client, route(exchange, orderIds, *request));
             } else {
                 sendResponse(client, jsonResponse(400, jsonError("could not parse request")));
             }

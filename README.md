@@ -12,6 +12,7 @@ The project currently provides an in-memory orderbook library with:
 - cancel by order ID
 - trader IDs and self-trade prevention
 - Clerk login support in the website
+- server-assigned HTTP order IDs
 - coarse-grained mutex protection
 - correctness tests
 - performance benchmarks

@@ -23,6 +23,7 @@ struct Trade {
 };
 
 struct SubmitResult {
+    OrderId orderId = 0;
     bool accepted = false;
     Qty filledQuantity = 0;
     Qty restingQuantity = 0;

@@ -192,6 +192,8 @@ See [HTTP_API.md](HTTP_API.md).
 
 The HTTP API does not accept `traderId` from the browser. It derives the trader from the authenticated Clerk bearer token.
 
+For new HTTP orders, `orderId` is assigned by the API server and returned in the order response. Clients only send `orderId` when replacing or canceling an existing order.
+
 ## CLI/HTTP Command Mapping
 
 A CLI or network API can map each command to one method:
