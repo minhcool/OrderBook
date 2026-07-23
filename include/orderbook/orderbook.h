@@ -45,6 +45,15 @@ struct BookSnapshot {
     std::vector<BookLevel> asks;
 };
 
+struct OpenOrder {
+    OrderId orderId = 0;
+    TraderId traderId = 0;
+    Side side = Side::Buy;
+    Price price = 0;
+    Qty quantity = 0;
+    Qty remainingQuantity = 0;
+};
+
 class orderbook {
 public:
     orderbook() = default;
@@ -82,6 +91,7 @@ public:
     Price bestBid() const;
     Price bestAsk() const;
     BookSnapshot snapshot(std::size_t depth = 10) const;
+    std::vector<OpenOrder> openOrders(TraderId traderId) const;
 
     void print(std::ostream& os) const;
 

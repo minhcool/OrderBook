@@ -7,12 +7,15 @@
 #include <cstdlib>
 #include <exception>
 #include <iostream>
+#include <map>
+#include <mutex>
 #include <optional>
 #include <regex>
 #include <sstream>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #ifdef _WIN32
@@ -68,6 +71,142 @@ struct ParsedOrder {
     OrderId orderId = 0;
     Price price = 0;
     Qty quantity = 0;
+};
+
+struct FillRecord {
+    std::uint64_t sequence = 0;
+    std::string symbol;
+    OrderId orderId = 0;
+    OrderId counterpartyOrderId = 0;
+    TraderId traderId = 0;
+    TraderId counterpartyTraderId = 0;
+    Side side = Side::Buy;
+    std::string liquidity;
+    Price price = 0;
+    Qty quantity = 0;
+    std::int64_t notional = 0;
+};
+
+struct PositionRecord {
+    std::string symbol;
+    Qty quantity = 0;
+    std::int64_t quoteCashFlow = 0;
+    Qty boughtQuantity = 0;
+    Qty soldQuantity = 0;
+};
+
+class AccountStore {
+public:
+    void recordTrades(const std::string& symbol, const SubmitResult& result) {
+        std::lock_guard<std::mutex> lock(accountMutex);
+
+        for (const Trade& trade : result.trades) {
+            appendFill(
+                symbol,
+                trade.takerId,
+                trade.makerId,
+                trade.takerTraderId,
+                trade.makerTraderId,
+                trade.takerSide,
+                "taker",
+                trade.price,
+                trade.quantity);
+
+            appendFill(
+                symbol,
+                trade.makerId,
+                trade.takerId,
+                trade.makerTraderId,
+                trade.takerTraderId,
+                opposite(trade.takerSide),
+                "maker",
+                trade.price,
+                trade.quantity);
+        }
+    }
+
+    std::vector<FillRecord> fillsForTrader(TraderId traderId) const {
+        std::lock_guard<std::mutex> lock(accountMutex);
+
+        std::vector<FillRecord> result;
+        for (const FillRecord& fill : fills) {
+            if (fill.traderId == traderId) {
+                result.push_back(fill);
+            }
+        }
+
+        std::sort(result.begin(), result.end(), [](const FillRecord& left, const FillRecord& right) {
+            return left.sequence > right.sequence;
+        });
+        return result;
+    }
+
+    std::vector<PositionRecord> positionsForTrader(TraderId traderId) const {
+        std::lock_guard<std::mutex> lock(accountMutex);
+
+        std::map<std::string, PositionRecord> bySymbol;
+        for (const FillRecord& fill : fills) {
+            if (fill.traderId != traderId) {
+                continue;
+            }
+
+            PositionRecord& position = bySymbol[fill.symbol];
+            position.symbol = fill.symbol;
+
+            if (fill.side == Side::Buy) {
+                position.quantity += fill.quantity;
+                position.quoteCashFlow -= fill.notional;
+                position.boughtQuantity += fill.quantity;
+            } else {
+                position.quantity -= fill.quantity;
+                position.quoteCashFlow += fill.notional;
+                position.soldQuantity += fill.quantity;
+            }
+        }
+
+        std::vector<PositionRecord> result;
+        result.reserve(bySymbol.size());
+        for (const auto& [symbol, position] : bySymbol) {
+            (void)symbol;
+            result.push_back(position);
+        }
+
+        return result;
+    }
+
+private:
+    static Side opposite(Side side) {
+        return side == Side::Buy ? Side::Sell : Side::Buy;
+    }
+
+    void appendFill(
+        const std::string& symbol,
+        OrderId orderId,
+        OrderId counterpartyOrderId,
+        TraderId traderId,
+        TraderId counterpartyTraderId,
+        Side side,
+        const std::string& liquidity,
+        Price price,
+        Qty quantity) {
+        fills.push_back({
+            nextSequence++,
+            symbol,
+            orderId,
+            counterpartyOrderId,
+            traderId,
+            counterpartyTraderId,
+            side,
+            liquidity,
+            price,
+            quantity,
+            price * quantity,
+        });
+    }
+
+    mutable std::mutex accountMutex;
+    std::uint64_t nextSequence = 1;
+    std::vector<FillRecord> fills;
 };
 
 #ifdef _WIN32
@@ -265,6 +404,116 @@ std::string serializeSymbols(const std::vector<std::string>& symbols) {
     }
 
     out << "]}";
+    return out.str();
+}
+
+struct SymbolOpenOrder {
+    std::string symbol;
+    OpenOrder order;
+};
+
+std::vector<SymbolOpenOrder> collectOpenOrders(const Exchange& exchange, TraderId traderId) {
+    std::vector<SymbolOpenOrder> result;
+
+    for (const std::string& symbol : exchange.symbols()) {
+        std::vector<OpenOrder> orders = exchange.openOrders(symbol, traderId);
+        for (const OpenOrder& order : orders) {
+            result.push_back({symbol, order});
+        }
+    }
+
+    std::sort(result.begin(), result.end(), [](const SymbolOpenOrder& left, const SymbolOpenOrder& right) {
+        return left.order.orderId < right.order.orderId;
+    });
+    return result;
+}
+
+std::string serializeOpenOrders(const std::vector<SymbolOpenOrder>& orders) {
+    std::ostringstream out;
+    out << "{\"orders\":[";
+
+    for (std::size_t i = 0; i < orders.size(); ++i) {
+        if (i > 0) {
+            out << ",";
+        }
+
+        const SymbolOpenOrder& item = orders[i];
+        out << "{"
+            << "\"symbol\":\"" << jsonEscape(item.symbol) << "\","
+            << "\"orderId\":" << item.order.orderId << ","
+            << "\"side\":\"" << sideToString(item.order.side) << "\","
+            << "\"price\":" << item.order.price << ","
+            << "\"quantity\":" << item.order.quantity << ","
+            << "\"remainingQuantity\":" << item.order.remainingQuantity
+            << "}";
+    }
+
+    out << "]}";
+    return out.str();
+}
+
+std::string serializeFills(const std::vector<FillRecord>& fills) {
+    std::ostringstream out;
+    out << "{\"fills\":[";
+
+    for (std::size_t i = 0; i < fills.size(); ++i) {
+        if (i > 0) {
+            out << ",";
+        }
+
+        const FillRecord& fill = fills[i];
+        out << "{"
+            << "\"sequence\":" << fill.sequence << ","
+            << "\"symbol\":\"" << jsonEscape(fill.symbol) << "\","
+            << "\"orderId\":" << fill.orderId << ","
+            << "\"counterpartyOrderId\":" << fill.counterpartyOrderId << ","
+            << "\"side\":\"" << sideToString(fill.side) << "\","
+            << "\"liquidity\":\"" << jsonEscape(fill.liquidity) << "\","
+            << "\"price\":" << fill.price << ","
+            << "\"quantity\":" << fill.quantity << ","
+            << "\"notional\":" << fill.notional
+            << "}";
+    }
+
+    out << "]}";
+    return out.str();
+}
+
+std::string serializePositions(const std::vector<PositionRecord>& positions) {
+    std::ostringstream out;
+    out << "{\"positions\":[";
+
+    for (std::size_t i = 0; i < positions.size(); ++i) {
+        if (i > 0) {
+            out << ",";
+        }
+
+        const PositionRecord& position = positions[i];
+        out << "{"
+            << "\"symbol\":\"" << jsonEscape(position.symbol) << "\","
+            << "\"quantity\":" << position.quantity << ","
+            << "\"quoteCashFlow\":" << position.quoteCashFlow << ","
+            << "\"boughtQuantity\":" << position.boughtQuantity << ","
+            << "\"soldQuantity\":" << position.soldQuantity
+            << "}";
+    }
+
+    out << "]}";
+    return out.str();
+}
+
+std::string serializeMe(
+    TraderId traderId,
+    const std::vector<SymbolOpenOrder>& orders,
+    const std::vector<FillRecord>& fills,
+    const std::vector<PositionRecord>& positions) {
+    std::ostringstream out;
+    out << "{"
+        << "\"traderId\":" << traderId << ","
+        << "\"openOrderCount\":" << orders.size() << ","
+        << "\"fillCount\":" << fills.size() << ","
+        << "\"positionCount\":" << positions.size()
+        << "}";
     return out.str();
 }
 
@@ -528,7 +777,48 @@ HttpResponse jsonResponse(int status, const std::string& body) {
     return {status, "application/json", body};
 }
 
-HttpResponse handlePostOrder(Exchange& exchange, OrderIdGenerator& orderIds, const std::string& path, const HttpRequest& request) {
+HttpResponse orderResultResponse(AccountStore& accounts, const std::string& symbol, const SubmitResult& result) {
+    accounts.recordTrades(symbol, result);
+    return jsonResponse(200, serializeSubmitResult(result));
+}
+
+HttpResponse handleGetMe(Exchange& exchange, AccountStore& accounts, const std::string& path, const HttpRequest& request) {
+    try {
+        const TraderId traderId = authenticatedTraderId(request);
+
+        if (path == "/me") {
+            const std::vector<SymbolOpenOrder> orders = collectOpenOrders(exchange, traderId);
+            const std::vector<FillRecord> fills = accounts.fillsForTrader(traderId);
+            const std::vector<PositionRecord> positions = accounts.positionsForTrader(traderId);
+            return jsonResponse(200, serializeMe(traderId, orders, fills, positions));
+        }
+
+        if (path == "/me/orders") {
+            return jsonResponse(200, serializeOpenOrders(collectOpenOrders(exchange, traderId)));
+        }
+
+        if (path == "/me/fills" || path == "/me/trades") {
+            return jsonResponse(200, serializeFills(accounts.fillsForTrader(traderId)));
+        }
+
+        if (path == "/me/positions") {
+            return jsonResponse(200, serializePositions(accounts.positionsForTrader(traderId)));
+        }
+    } catch (const AuthError& ex) {
+        return jsonResponse(401, jsonError(ex.what()));
+    } catch (const std::exception& ex) {
+        return jsonResponse(400, jsonError(ex.what()));
+    }
+
+    return jsonResponse(404, jsonError("unknown GET endpoint"));
+}
+
+HttpResponse handlePostOrder(
+    Exchange& exchange,
+    AccountStore& accounts,
+    OrderIdGenerator& orderIds,
+    const std::string& path,
+    const HttpRequest& request) {
     try {
         const TraderId traderId = authenticatedTraderId(request);
         const std::string& body = request.body;
@@ -536,69 +826,69 @@ HttpResponse handlePostOrder(Exchange& exchange, OrderIdGenerator& orderIds, con
         if (path == "/orders/buy") {
             ParsedOrder order = parseNewOrderWithPrice(body);
             order.orderId = orderIds.next();
-            return jsonResponse(200, serializeSubmitResult(
-                exchange.buy(order.symbol, traderId, order.orderId, order.price, order.quantity)));
+            return orderResultResponse(accounts, order.symbol,
+                exchange.buy(order.symbol, traderId, order.orderId, order.price, order.quantity));
         }
 
         if (path == "/orders/sell") {
             ParsedOrder order = parseNewOrderWithPrice(body);
             order.orderId = orderIds.next();
-            return jsonResponse(200, serializeSubmitResult(
-                exchange.sell(order.symbol, traderId, order.orderId, order.price, order.quantity)));
+            return orderResultResponse(accounts, order.symbol,
+                exchange.sell(order.symbol, traderId, order.orderId, order.price, order.quantity));
         }
 
         if (path == "/orders/market-buy") {
             ParsedOrder order = parseNewMarketOrder(body);
             order.orderId = orderIds.next();
-            return jsonResponse(200, serializeSubmitResult(
-                exchange.marketBuy(order.symbol, traderId, order.orderId, order.quantity)));
+            return orderResultResponse(accounts, order.symbol,
+                exchange.marketBuy(order.symbol, traderId, order.orderId, order.quantity));
         }
 
         if (path == "/orders/market-sell") {
             ParsedOrder order = parseNewMarketOrder(body);
             order.orderId = orderIds.next();
-            return jsonResponse(200, serializeSubmitResult(
-                exchange.marketSell(order.symbol, traderId, order.orderId, order.quantity)));
+            return orderResultResponse(accounts, order.symbol,
+                exchange.marketSell(order.symbol, traderId, order.orderId, order.quantity));
         }
 
         if (path == "/orders/ioc-buy") {
             ParsedOrder order = parseNewOrderWithPrice(body);
             order.orderId = orderIds.next();
-            return jsonResponse(200, serializeSubmitResult(
-                exchange.iocBuy(order.symbol, traderId, order.orderId, order.price, order.quantity)));
+            return orderResultResponse(accounts, order.symbol,
+                exchange.iocBuy(order.symbol, traderId, order.orderId, order.price, order.quantity));
         }
 
         if (path == "/orders/ioc-sell") {
             ParsedOrder order = parseNewOrderWithPrice(body);
             order.orderId = orderIds.next();
-            return jsonResponse(200, serializeSubmitResult(
-                exchange.iocSell(order.symbol, traderId, order.orderId, order.price, order.quantity)));
+            return orderResultResponse(accounts, order.symbol,
+                exchange.iocSell(order.symbol, traderId, order.orderId, order.price, order.quantity));
         }
 
         if (path == "/orders/fok-buy") {
             ParsedOrder order = parseNewOrderWithPrice(body);
             order.orderId = orderIds.next();
-            return jsonResponse(200, serializeSubmitResult(
-                exchange.fokBuy(order.symbol, traderId, order.orderId, order.price, order.quantity)));
+            return orderResultResponse(accounts, order.symbol,
+                exchange.fokBuy(order.symbol, traderId, order.orderId, order.price, order.quantity));
         }
 
         if (path == "/orders/fok-sell") {
             ParsedOrder order = parseNewOrderWithPrice(body);
             order.orderId = orderIds.next();
-            return jsonResponse(200, serializeSubmitResult(
-                exchange.fokSell(order.symbol, traderId, order.orderId, order.price, order.quantity)));
+            return orderResultResponse(accounts, order.symbol,
+                exchange.fokSell(order.symbol, traderId, order.orderId, order.price, order.quantity));
         }
 
         if (path == "/orders/replace-buy") {
             const ParsedOrder order = parseOrderWithPrice(body);
-            return jsonResponse(200, serializeSubmitResult(
-                exchange.replaceBuy(order.symbol, traderId, order.orderId, order.price, order.quantity)));
+            return orderResultResponse(accounts, order.symbol,
+                exchange.replaceBuy(order.symbol, traderId, order.orderId, order.price, order.quantity));
         }
 
         if (path == "/orders/replace-sell") {
             const ParsedOrder order = parseOrderWithPrice(body);
-            return jsonResponse(200, serializeSubmitResult(
-                exchange.replaceSell(order.symbol, traderId, order.orderId, order.price, order.quantity)));
+            return orderResultResponse(accounts, order.symbol,
+                exchange.replaceSell(order.symbol, traderId, order.orderId, order.price, order.quantity));
         }
 
         if (path == "/orders/cancel") {
@@ -621,7 +911,7 @@ HttpResponse handlePostOrder(Exchange& exchange, OrderIdGenerator& orderIds, con
     return jsonResponse(404, jsonError("unknown POST endpoint"));
 }
 
-HttpResponse route(Exchange& exchange, OrderIdGenerator& orderIds, const HttpRequest& request) {
+HttpResponse route(Exchange& exchange, AccountStore& accounts, OrderIdGenerator& orderIds, const HttpRequest& request) {
     const auto [path, query] = splitQuery(request.path);
 
     if (request.method == "OPTIONS") {
@@ -642,11 +932,16 @@ HttpResponse route(Exchange& exchange, OrderIdGenerator& orderIds, const HttpReq
             return jsonResponse(200, serializeSnapshot(*symbol, exchange.snapshot(*symbol, parseDepth(query))));
         }
 
+        if (path == "/me" || path == "/me/orders" || path == "/me/fills" || path == "/me/trades"
+            || path == "/me/positions") {
+            return handleGetMe(exchange, accounts, path, request);
+        }
+
         return jsonResponse(404, jsonError("unknown GET endpoint"));
     }
 
     if (request.method == "POST") {
-        return handlePostOrder(exchange, orderIds, path, request);
+        return handlePostOrder(exchange, accounts, orderIds, path, request);
     }
 
     return jsonResponse(405, jsonError("only GET, POST, and OPTIONS are supported"));
@@ -799,6 +1094,7 @@ int main(int argc, char** argv) {
         SocketRuntime runtime;
         SocketHandle server = createServerSocket(port);
         Exchange exchange;
+        AccountStore accounts;
         OrderIdGenerator orderIds;
         seedDefaultBooks(exchange);
 
@@ -815,7 +1111,7 @@ int main(int argc, char** argv) {
 
             std::optional<HttpRequest> request = readRequest(client);
             if (request) {
-                sendResponse(client, route(exchange, orderIds, *request));
+                sendResponse(client, route(exchange, accounts, orderIds, *request));
             } else {
                 sendResponse(client, jsonResponse(400, jsonError("could not parse request")));
             }

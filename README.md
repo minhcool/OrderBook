@@ -13,6 +13,7 @@ The project currently provides an in-memory orderbook library with:
 - trader IDs and self-trade prevention
 - Clerk login support in the website
 - server-assigned HTTP order IDs
+- authenticated open-order, fill-history, and derived-position endpoints
 - coarse-grained mutex protection
 - correctness tests
 - performance benchmarks
@@ -124,9 +125,9 @@ For deploying the C++ API server, see [docs/DEPLOY_API.md](docs/DEPLOY_API.md).
 - No CLI yet.
 - Local HTTP API exists for testing, but it is not production-grade.
 - No WebSocket/FIX API yet.
-- Website uses Clerk login, but account storage/roles are not implemented yet.
+- Website uses Clerk login, but roles are not implemented yet.
 - Backend JWT signature verification is not implemented yet; the current API auth bridge is for development.
-- No accounts, balances, margin, or settlement.
+- No durable balances, margin, or settlement.
 - No persistence or event log.
 - No tick size or lot size validation.
 - Cancel and replace still scan the book instead of using an order ID index.

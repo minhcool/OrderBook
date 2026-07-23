@@ -371,6 +371,36 @@ void test_exchange_routes_by_symbol() {
     assert(symbols[1] == "ETH-USD");
 }
 
+void test_open_orders_by_trader() {
+    Exchange exchange;
+
+    assert(exchange.buy("BTC-USD", 10, 1, 99, 5).accepted);
+    assert(exchange.sell("BTC-USD", 20, 2, 100, 7).accepted);
+
+    SubmitResult partialFill = exchange.buy("BTC-USD", 30, 3, 100, 3);
+    assert(partialFill.accepted);
+    assert(partialFill.filledQuantity == 3);
+
+    std::vector<OpenOrder> trader10 = exchange.openOrders("BTC-USD", 10);
+    assert(trader10.size() == 1);
+    assert(trader10[0].orderId == 1);
+    assert(trader10[0].traderId == 10);
+    assert(trader10[0].side == Side::Buy);
+    assert(trader10[0].price == 99);
+    assert(trader10[0].quantity == 5);
+    assert(trader10[0].remainingQuantity == 5);
+
+    std::vector<OpenOrder> trader20 = exchange.openOrders("BTC-USD", 20);
+    assert(trader20.size() == 1);
+    assert(trader20[0].orderId == 2);
+    assert(trader20[0].side == Side::Sell);
+    assert(trader20[0].price == 100);
+    assert(trader20[0].quantity == 7);
+    assert(trader20[0].remainingQuantity == 4);
+
+    assert(exchange.openOrders("BTC-USD", 30).empty());
+}
+
 void test_modify_order_that_crosses_spread() {
     orderbook book;
 
@@ -462,6 +492,7 @@ int main() {
     test_named_order_entry_api_methods();
     test_book_snapshot();
     test_exchange_routes_by_symbol();
+    test_open_orders_by_trader();
     test_modify_order_that_crosses_spread();
     test_self_trade_prevention_rejects_incoming_order();
     test_self_trade_prevention_after_partial_external_fill();

@@ -394,6 +394,119 @@ label {
   grid-template-columns: 1fr auto;
 }
 
+.account-panel {
+  grid-column: 1 / -1;
+}
+
+.account-summary {
+  border-bottom: 1px solid #edf1f5;
+  display: grid;
+  gap: 1px;
+  grid-template-columns: repeat(4, 1fr);
+  margin: -4px 0 14px;
+}
+
+.account-stat {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+  padding: 8px 12px 12px 0;
+}
+
+.account-stat span,
+.account-section h3 {
+  color: #66758b;
+  font-size: 12px;
+  font-weight: 800;
+  letter-spacing: 0.04em;
+  margin: 0;
+  text-transform: uppercase;
+}
+
+.account-stat strong {
+  font-size: 18px;
+  overflow-wrap: anywhere;
+}
+
+.account-grid {
+  display: grid;
+  gap: 18px;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.account-section {
+  min-width: 0;
+}
+
+.data-list {
+  display: grid;
+  margin-top: 8px;
+}
+
+.data-row {
+  align-items: center;
+  border-top: 1px solid #edf1f5;
+  display: grid;
+  gap: 12px;
+  grid-template-columns: minmax(0, 1fr) auto;
+  min-height: 54px;
+  padding: 10px 0;
+}
+
+.data-main,
+.data-values {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+}
+
+.data-main strong,
+.data-values strong {
+  align-items: center;
+  display: flex;
+  gap: 7px;
+  min-width: 0;
+}
+
+.data-main span,
+.data-values span {
+  color: #66758b;
+  font-size: 13px;
+  overflow-wrap: anywhere;
+}
+
+.data-values {
+  justify-items: end;
+  text-align: right;
+}
+
+.side-chip {
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 800;
+  line-height: 1;
+  padding: 4px 6px;
+  text-transform: uppercase;
+}
+
+.side-chip.buy,
+.buy-text {
+  color: #137447;
+}
+
+.side-chip.sell,
+.sell-text {
+  color: #b64236;
+}
+
+.side-chip.buy {
+  background: #e9f8ef;
+}
+
+.side-chip.sell {
+  background: #fff0ee;
+}
+
 .activity-list {
   display: grid;
   gap: 8px;
@@ -447,7 +560,8 @@ label {
 
 @media (max-width: 980px) {
   .connection-band,
-  .workspace {
+  .workspace,
+  .account-grid {
     grid-template-columns: 1fr;
   }
 
@@ -468,6 +582,7 @@ label {
   }
 
   .market-strip,
+  .account-summary,
   .book-grid,
   .form-grid {
     grid-template-columns: 1fr;

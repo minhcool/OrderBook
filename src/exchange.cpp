@@ -88,6 +88,40 @@ BookSnapshot Exchange::snapshot(const std::string& symbol, std::size_t depth) co
     return book->snapshot(depth);
 }
 
+std::vector<OpenOrder> Exchange::openOrders(const std::string& symbol, TraderId traderId) const {
+    const orderbook* book = findBook(symbol);
+    if (book == nullptr) {
+        return {};
+    }
+
+    return book->openOrders(traderId);
+}
+
+std::vector<OpenOrder> Exchange::openOrders(TraderId traderId) const {
+    std::vector<std::pair<std::string, const orderbook*>> booksToRead;
+
+    {
+        std::lock_guard<std::mutex> lock(exchangeMutex);
+        booksToRead.reserve(books.size());
+        for (const auto& [symbol, book] : books) {
+            (void)symbol;
+            booksToRead.push_back({symbol, book.get()});
+        }
+    }
+
+    std::vector<OpenOrder> result;
+    for (const auto& [symbol, book] : booksToRead) {
+        (void)symbol;
+        std::vector<OpenOrder> orders = book->openOrders(traderId);
+        result.insert(result.end(), orders.begin(), orders.end());
+    }
+
+    std::sort(result.begin(), result.end(), [](const OpenOrder& left, const OpenOrder& right) {
+        return left.orderId < right.orderId;
+    });
+    return result;
+}
+
 std::vector<std::string> Exchange::symbols() const {
     std::lock_guard<std::mutex> lock(exchangeMutex);
 

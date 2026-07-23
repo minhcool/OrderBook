@@ -1,4 +1,15 @@
-import type { BookSnapshot, NewOrderRequest, OrderMode, ReplaceOrderRequest, Side, SubmitResult } from "./types";
+import type {
+  BookSnapshot,
+  FillRecord,
+  MeSummary,
+  NewOrderRequest,
+  OpenOrder,
+  OrderMode,
+  PositionRecord,
+  ReplaceOrderRequest,
+  Side,
+  SubmitResult
+} from "./types";
 
 export class ApiError extends Error {
   constructor(message: string, public readonly status?: number) {
@@ -88,4 +99,31 @@ export async function cancelOrder(
     headers: authHeaders(token),
     body: JSON.stringify({ symbol, orderId })
   });
+}
+
+export async function fetchMe(apiBase: string, token: string): Promise<MeSummary> {
+  return requestJson(`${apiBase}/me`, {
+    headers: authHeaders(token)
+  });
+}
+
+export async function fetchOpenOrders(apiBase: string, token: string): Promise<OpenOrder[]> {
+  const data = await requestJson<{ orders: OpenOrder[] }>(`${apiBase}/me/orders`, {
+    headers: authHeaders(token)
+  });
+  return data.orders;
+}
+
+export async function fetchFills(apiBase: string, token: string): Promise<FillRecord[]> {
+  const data = await requestJson<{ fills: FillRecord[] }>(`${apiBase}/me/fills`, {
+    headers: authHeaders(token)
+  });
+  return data.fills;
+}
+
+export async function fetchPositions(apiBase: string, token: string): Promise<PositionRecord[]> {
+  const data = await requestJson<{ positions: PositionRecord[] }>(`${apiBase}/me/positions`, {
+    headers: authHeaders(token)
+  });
+  return data.positions;
 }

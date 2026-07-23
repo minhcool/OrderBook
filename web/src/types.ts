@@ -34,6 +34,42 @@ export interface BookSnapshot {
   asks: BookLevel[];
 }
 
+export interface OpenOrder {
+  symbol: string;
+  orderId: number;
+  side: Side;
+  price: number;
+  quantity: number;
+  remainingQuantity: number;
+}
+
+export interface FillRecord {
+  sequence: number;
+  symbol: string;
+  orderId: number;
+  counterpartyOrderId: number;
+  side: Side;
+  liquidity: "maker" | "taker";
+  price: number;
+  quantity: number;
+  notional: number;
+}
+
+export interface PositionRecord {
+  symbol: string;
+  quantity: number;
+  quoteCashFlow: number;
+  boughtQuantity: number;
+  soldQuantity: number;
+}
+
+export interface MeSummary {
+  traderId: number;
+  openOrderCount: number;
+  fillCount: number;
+  positionCount: number;
+}
+
 export interface NewOrderRequest {
   symbol: string;
   price?: number;

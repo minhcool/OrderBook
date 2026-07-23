@@ -179,10 +179,17 @@ bool hasBestAsk() const;
 Price bestBid() const;
 Price bestAsk() const;
 
+BookSnapshot snapshot(std::size_t depth = 10) const;
+std::vector<OpenOrder> openOrders(TraderId traderId) const;
+
 void print(std::ostream& os) const;
 ```
 
 `bestBid()` and `bestAsk()` return `0` if that side of the book is empty. Use `hasBestBid()` and `hasBestAsk()` when `0` could be ambiguous.
+
+`snapshot()` aggregates price levels for the public book view.
+
+`openOrders(traderId)` returns that trader's live resting orders, including original quantity and remaining quantity.
 
 ## Local HTTP API
 

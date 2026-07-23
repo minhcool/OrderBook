@@ -175,6 +175,33 @@ BookSnapshot orderbook::snapshot(std::size_t depth) const {
     return result;
 }
 
+std::vector<OpenOrder> orderbook::openOrders(TraderId traderId) const {
+    std::lock_guard<std::mutex> lock(bookMutex);
+
+    std::vector<OpenOrder> result;
+    const auto append = [&result, traderId](Side side, const auto& book) {
+        for (const auto& [price, queue] : book) {
+            (void)price;
+            for (const order& resting : queue) {
+                if (resting.getTraderId() == traderId) {
+                    result.push_back({
+                        resting.getId(),
+                        resting.getTraderId(),
+                        side,
+                        resting.getPrice(),
+                        resting.getQuantity(),
+                        resting.getRemainingQuantity(),
+                    });
+                }
+            }
+        }
+    };
+
+    append(Side::Buy, buys);
+    append(Side::Sell, sells);
+    return result;
+}
+
 void orderbook::print(std::ostream& os) const {
     std::lock_guard<std::mutex> lock(bookMutex);
 
