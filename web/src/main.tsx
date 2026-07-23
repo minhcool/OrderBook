@@ -17,6 +17,7 @@ import {
 } from "lucide-react";
 
 import {
+  advanceSimulator,
   cancelOrder,
   fetchBook,
   fetchFills,
@@ -116,6 +117,8 @@ function App() {
   const [fills, setFills] = React.useState<FillRecord[]>([]);
   const [portfolio, setPortfolio] = React.useState<PortfolioRecord | null>(null);
   const [leaderboard, setLeaderboard] = React.useState<LeaderboardRow[]>([]);
+  const [liveUpdates, setLiveUpdates] = React.useState(() => localStorage.getItem("orderbook.liveUpdates") !== "false");
+  const liveRefreshInFlight = React.useRef(false);
 
   const [side, setSide] = React.useState<Side>("buy");
   const [mode, setMode] = React.useState<OrderMode>("limit");
@@ -305,12 +308,56 @@ function App() {
   }, [refresh, refreshAccount]);
 
   React.useEffect(() => {
+    localStorage.setItem("orderbook.liveUpdates", liveUpdates ? "true" : "false");
+  }, [liveUpdates]);
+
+  React.useEffect(() => {
     void refresh();
   }, [refresh]);
 
   React.useEffect(() => {
     void refreshAccount();
   }, [refreshAccount]);
+
+  React.useEffect(() => {
+    if (!liveUpdates || !isLoaded || !isSignedIn || !isEntered) {
+      return;
+    }
+
+    const intervalId = window.setInterval(() => {
+      if (liveRefreshInFlight.current) {
+        return;
+      }
+
+      liveRefreshInFlight.current = true;
+      void (async () => {
+        try {
+          const token = await getToken();
+          if (token && !isCompetitive) {
+            await advanceSimulator(apiBase, roomId, token, 1);
+          }
+
+          await refreshAll();
+        } catch {
+          setApiOnline(false);
+        } finally {
+          liveRefreshInFlight.current = false;
+        }
+      })();
+    }, isCompetitive ? 2500 : 1500);
+
+    return () => window.clearInterval(intervalId);
+  }, [
+    apiBase,
+    getToken,
+    isCompetitive,
+    isEntered,
+    isLoaded,
+    isSignedIn,
+    liveUpdates,
+    refreshAll,
+    roomId
+  ]);
 
   async function handleSubmitOrder(event: React.FormEvent) {
     event.preventDefault();
@@ -528,6 +575,14 @@ function App() {
           <PlugZap size={17} />
           Connect
         </button>
+        <label className="toggle-row">
+          <input
+            type="checkbox"
+            checked={liveUpdates}
+            onChange={(event) => setLiveUpdates(event.target.checked)}
+          />
+          Live
+        </label>
         <div className="symbols">
           {canViewMarket
             ? symbols.map((item) => (

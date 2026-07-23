@@ -181,6 +181,31 @@ Response:
 { "symbols": ["BTC-USD", "ETH-USD"] }
 ```
 
+Advance a single-player simulator:
+
+```http
+POST /rooms/{roomId}/simulator/tick
+```
+
+Body:
+
+```json
+{ "steps": 1 }
+```
+
+This requires entering the single-player room first. `steps` is clamped to `1..25`. Each tick moves hidden fair values, refreshes house liquidity, and can fill the user's resting orders if simulated quotes cross them.
+
+Response:
+
+```json
+{
+  "advanced": true,
+  "steps": 1,
+  "trades": 0,
+  "symbols": ["NOVA", "ORBIT", "LYRA", "MIST"]
+}
+```
+
 Market prices:
 
 ```http

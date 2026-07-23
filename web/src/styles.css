@@ -165,7 +165,7 @@ select:focus {
   align-items: end;
   display: grid;
   gap: 12px;
-  grid-template-columns: minmax(220px, 1.25fr) minmax(160px, 0.8fr) minmax(170px, 0.9fr) minmax(120px, 0.6fr) auto;
+  grid-template-columns: minmax(220px, 1.25fr) minmax(160px, 0.8fr) minmax(170px, 0.9fr) minmax(120px, 0.6fr) auto auto;
   padding: 14px;
 }
 
@@ -177,6 +177,27 @@ label {
   gap: 6px;
   letter-spacing: 0.04em;
   text-transform: uppercase;
+}
+
+.toggle-row {
+  align-items: center;
+  background: #ffffff;
+  border: 1px solid #d8e0ea;
+  border-radius: 8px;
+  color: #667389;
+  display: flex;
+  gap: 8px;
+  justify-content: center;
+  letter-spacing: 0;
+  min-height: 43px;
+  padding: 0 14px;
+  text-transform: none;
+}
+
+.toggle-row input {
+  accent-color: #2f7d49;
+  height: 16px;
+  width: 16px;
 }
 
 .symbols {

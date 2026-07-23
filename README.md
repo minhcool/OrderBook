@@ -16,6 +16,7 @@ The project currently provides an in-memory orderbook library with:
 - authenticated open-order, fill-history, and derived-position endpoints
 - room/lobby trade tape, last-trade marks, and simple portfolio valuation
 - single-player and competitive game rooms
+- single-player simulated market ticks with dynamic house liquidity
 - multiple competitive lobbies with independent books and enforced capacities
 - authenticated room/lobby enter and exit
 - one active session per user
@@ -23,6 +24,7 @@ The project currently provides an in-memory orderbook library with:
 - waiting/starting/running/finished competitive lobby lifecycle
 - starting cash, available cash, reserved cash, and no-short/no-overspend checks
 - manual and bot tracks with chess-style Elo updates at game end
+- bot-facing HTTP workflow using the same room/lobby APIs
 - optional PostgreSQL event/history persistence through `DATABASE_URL`
 - startup restore from a replayable PostgreSQL event log
 - checkpoint watermark records for future snapshot fast-forwarding
@@ -150,11 +152,13 @@ For the Vercel-ready website, see [docs/WEBSITE.md](docs/WEBSITE.md).
 
 For deploying the C++ API server, see [docs/DEPLOY_API.md](docs/DEPLOY_API.md).
 
+For bot clients, see [docs/BOT_API.md](docs/BOT_API.md).
+
 ## Current Limitations
 
 - No CLI yet.
 - Local HTTP API exists for testing, but it is not production-grade.
-- No WebSocket/FIX API yet.
+- No WebSocket/FIX API yet; live updates currently use polling.
 - Website uses Clerk login, but roles are not implemented yet.
 - Backend JWT signature verification is not implemented yet; the current API auth bridge is for development.
 - PostgreSQL restore replays the ordered event log from the beginning; checkpoint rows are watermarks, not full snapshot fast-forward restore yet.
@@ -163,6 +167,7 @@ For deploying the C++ API server, see [docs/DEPLOY_API.md](docs/DEPLOY_API.md).
 - Portfolio values are estimates from starting cash, fill cash flow, reserved cash, and in-memory last-trade marks.
 - Competitive lobbies are currently seeded at startup; dynamic lobby creation and matchmaking are not implemented yet.
 - No news engine or bot tournament scheduler yet.
+- Bots currently use Clerk session tokens; API-key auth is not implemented yet.
 - Masked-real-series assets are only metadata placeholders until a licensed historical data import exists.
 - No tick size or lot size validation.
 - Cancel and replace still scan the book instead of using an order ID index.

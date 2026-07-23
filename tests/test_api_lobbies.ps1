@@ -65,6 +65,27 @@ try {
         -Headers (Get-AuthHeaders "solo-player")
     Assert-Equal $soloSymbols.symbols[0] "LYRA" "Solo symbols after entering"
 
+    $beforeTickBook = Invoke-RestMethod `
+        -Uri "$apiBase/rooms/solo-alpha/book/NOVA" `
+        -Headers (Get-AuthHeaders "solo-player")
+
+    $tick = Invoke-RestMethod `
+        -Uri "$apiBase/rooms/solo-alpha/simulator/tick" `
+        -Method Post `
+        -Headers (Get-AuthHeaders "solo-player") `
+        -ContentType "application/json" `
+        -Body '{"steps":20}'
+    Assert-Equal $tick.advanced $true "Simulator tick advanced"
+    Assert-Equal $tick.steps 20 "Simulator tick steps"
+
+    $afterTickBook = Invoke-RestMethod `
+        -Uri "$apiBase/rooms/solo-alpha/book/NOVA" `
+        -Headers (Get-AuthHeaders "solo-player")
+    if ($beforeTickBook.asks[0].price -eq $afterTickBook.asks[0].price `
+        -and $beforeTickBook.bids[0].price -eq $afterTickBook.bids[0].price) {
+        throw "Simulator tick did not move NOVA quotes."
+    }
+
     try {
         Invoke-RestMethod `
             -Uri "$apiBase/lobbies/aurora-open-10/join" `
@@ -117,6 +138,27 @@ try {
     } catch {
         Assert-Equal ([int]$_.Exception.Response.StatusCode) 403 "Pre-join trade status"
     }
+
+    $botJoin = Invoke-RestMethod `
+        -Uri "$apiBase/lobbies/aurora-open-20/join" `
+        -Method Post `
+        -Headers (Get-AuthHeaders "bot-player") `
+        -ContentType "application/json" `
+        -Body '{"track":"bot"}'
+    Assert-Equal $botJoin.joined $true "Bot join result"
+
+    $botMembership = Invoke-RestMethod `
+        -Uri "$apiBase/lobbies/aurora-open-20/membership" `
+        -Headers (Get-AuthHeaders "bot-player")
+    Assert-Equal $botMembership.track "bot" "Bot membership track"
+
+    $botLeave = Invoke-RestMethod `
+        -Uri "$apiBase/lobbies/aurora-open-20/leave" `
+        -Method Post `
+        -Headers (Get-AuthHeaders "bot-player") `
+        -ContentType "application/json" `
+        -Body "{}"
+    Assert-Equal $botLeave.left $true "Bot leave result"
 
     for ($i = 1; $i -le 10; $i++) {
         $join = Invoke-RestMethod `

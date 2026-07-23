@@ -19,6 +19,7 @@ import type {
   ReplaceOrderRequest,
   SessionSummary,
   Side,
+  SimulatorTickResult,
   SubmitResult
 } from "./types";
 
@@ -110,11 +111,11 @@ export async function fetchLobbyMembership(apiBase: string, lobbyId: string, tok
   });
 }
 
-export async function joinLobby(apiBase: string, lobbyId: string, token: string): Promise<JoinResult> {
+export async function joinLobby(apiBase: string, lobbyId: string, token: string, track = "manual"): Promise<JoinResult> {
   return requestJson(`${apiBase}/lobbies/${encodeURIComponent(lobbyId)}/join`, {
     method: "POST",
     headers: authHeaders(token),
-    body: JSON.stringify({ track: "manual" })
+    body: JSON.stringify({ track })
   });
 }
 
@@ -129,6 +130,19 @@ export async function leaveLobby(apiBase: string, lobbyId: string, token: string
 export async function fetchSymbols(apiBase: string, scope?: MarketScope): Promise<string[]> {
   const data = await requestJson<{ symbols: string[] }>(`${scopedBase(apiBase, scope)}/symbols`);
   return data.symbols;
+}
+
+export async function advanceSimulator(
+  apiBase: string,
+  roomId: string,
+  token: string,
+  steps = 1
+): Promise<SimulatorTickResult> {
+  return requestJson(`${apiBase}/rooms/${encodeURIComponent(roomId)}/simulator/tick`, {
+    method: "POST",
+    headers: authHeaders(token),
+    body: JSON.stringify({ steps })
+  });
 }
 
 export async function fetchBook(apiBase: string, scope: MarketScope | undefined, symbol: string, depth: number): Promise<BookSnapshot> {

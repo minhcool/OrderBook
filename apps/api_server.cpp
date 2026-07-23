@@ -216,6 +216,17 @@ struct PortfolioRecord {
     std::vector<PortfolioPositionRecord> positions;
 };
 
+struct SimulatorSymbolState {
+    std::uint64_t tick = 0;
+    double fairValue = 0.0;
+};
+
+struct SimulatorTickResult {
+    int steps = 0;
+    std::vector<std::string> symbols;
+    std::size_t trades = 0;
+};
+
 class AccountStore {
 public:
     void recordTrades(const std::string& symbol, const SubmitResult& result) {
@@ -604,6 +615,7 @@ struct GameRoom {
     AccountStore accounts;
     OrderIdGenerator orderIds;
     std::vector<AssetConfig> assets;
+    std::map<std::string, SimulatorSymbolState> simulator;
 };
 
 struct ParsedRoomPath {
@@ -687,6 +699,7 @@ struct RestoreStats {
     std::size_t sessions = 0;
     std::size_t orders = 0;
     std::size_t cancels = 0;
+    std::size_t simulatorTicks = 0;
     std::size_t skipped = 0;
 };
 
@@ -1258,6 +1271,25 @@ std::string serializeSymbols(const std::vector<std::string>& symbols) {
         }
 
         out << "\"" << jsonEscape(symbols[i]) << "\"";
+    }
+
+    out << "]}";
+    return out.str();
+}
+
+std::string serializeSimulatorTickResult(const SimulatorTickResult& result) {
+    std::ostringstream out;
+    out << "{\"advanced\":true,"
+        << "\"steps\":" << result.steps << ","
+        << "\"trades\":" << result.trades << ","
+        << "\"symbols\":[";
+
+    for (std::size_t i = 0; i < result.symbols.size(); ++i) {
+        if (i > 0) {
+            out << ",";
+        }
+
+        out << "\"" << jsonEscape(result.symbols[i]) << "\"";
     }
 
     out << "]}";
@@ -2108,6 +2140,23 @@ public:
             });
     }
 
+    void recordSimulatorTick(
+        const std::string& sessionId,
+        const std::string& roomId,
+        TraderId traderId,
+        int steps) {
+        PersistedEvent event;
+        event.eventType = "simulator_tick";
+        event.sessionId = sessionId;
+        event.roomId = roomId;
+        event.roomMode = RoomMode::Single;
+        event.traderId = traderId;
+        event.orderMode = "simulator";
+        event.quantity = steps;
+        event.createdAt = Clock::now();
+        appendPersistedEvent(event);
+    }
+
     void recordTrades(const std::string& sessionId, const std::string& symbol, const SubmitResult& result) {
         for (const Trade& trade : result.trades) {
             execParams(
@@ -2579,6 +2628,8 @@ bool hasSymbol(const Exchange& exchange, const std::string& symbol) {
     const std::vector<std::string> symbols = exchange.symbols();
     return std::find(symbols.begin(), symbols.end(), symbol) != symbols.end();
 }
+
+SimulatorTickResult advanceSinglePlayerSimulator(GameRoom& room, int steps);
 
 std::optional<std::int64_t> marketBuyNotionalEstimate(const Exchange& exchange, const std::string& symbol, Qty quantity) {
     BookSnapshot snapshot = exchange.snapshot(symbol, std::numeric_limits<std::size_t>::max());
@@ -3243,6 +3294,19 @@ HttpResponse route(RoomStore& rooms, PersistenceStore& persistence, const HttpRe
                 return jsonResponse(403, jsonError("enter this room before viewing or trading"));
             }
 
+            if (request.method == "POST" && roomPath->nestedPath == "/simulator/tick") {
+                if (room->mode != RoomMode::Single) {
+                    return jsonResponse(400, jsonError("simulator ticks are only available in single-player rooms"));
+                }
+
+                const int steps = static_cast<int>(std::max<std::int64_t>(
+                    1,
+                    std::min<std::int64_t>(jsonIntField(request.body, "steps").value_or(1), 25)));
+                const SimulatorTickResult result = advanceSinglePlayerSimulator(*session->game, steps);
+                persistence.recordSimulatorTick(session->id, room->id, user.traderId, result.steps);
+                return jsonResponse(200, serializeSimulatorTickResult(result));
+            }
+
             HttpRequest scopedRequest = request;
             scopedRequest.path = roomPath->nestedPath + (query.empty() ? "" : "?" + query);
             return routeRoom(*session->game, persistence, session->id, scopedRequest);
@@ -3395,6 +3459,19 @@ SocketHandle createServerSocket(int port) {
 
 constexpr TraderId HouseTraderId = 9'000'000'001LL;
 
+double deterministicNoise(const std::string& symbol, std::uint64_t tick, int salt) {
+    std::uint64_t hash = 1469598103934665603ULL;
+    for (unsigned char ch : symbol) {
+        hash ^= ch;
+        hash *= 1099511628211ULL;
+    }
+
+    hash ^= (tick + 0x9e3779b97f4a7c15ULL + static_cast<std::uint64_t>(salt) * 0xbf58476d1ce4e5b9ULL);
+    hash *= 1099511628211ULL;
+    const double unit = static_cast<double>(hash % 20001ULL) / 10000.0;
+    return unit - 1.0;
+}
+
 void seedDefaultBooks(Exchange& exchange) {
     exchange.ensureBook("BTC-USD");
     exchange.ensureBook("ETH-USD");
@@ -3419,7 +3496,98 @@ void seedHouseLiquidity(GameRoom& room, const AssetConfig& asset, int levels, Qt
     }
 }
 
+void initializeSimulator(GameRoom& room) {
+    for (const AssetConfig& asset : room.assets) {
+        room.simulator[asset.symbol] = {0, static_cast<double>(asset.referencePrice)};
+    }
+}
+
+void cancelHouseOrdersForSymbol(GameRoom& room, const std::string& symbol) {
+    const std::vector<OpenOrder> orders = room.exchange.openOrders(symbol, HouseTraderId);
+    for (const OpenOrder& order : orders) {
+        room.exchange.cancelForTrader(symbol, HouseTraderId, order.orderId);
+    }
+}
+
+double nextFairValue(const AssetConfig& asset, SimulatorSymbolState& state) {
+    ++state.tick;
+
+    const double reference = static_cast<double>(asset.referencePrice);
+    const double noise = deterministicNoise(asset.symbol, state.tick, 1);
+    double drift = 0.0;
+
+    if (asset.behavior == "trend-cycle") {
+        drift = 0.10 + std::sin(static_cast<double>(state.tick) / 5.0) * 0.35 + noise * 0.18;
+    } else if (asset.behavior == "mean-reverting") {
+        drift = (reference - state.fairValue) * 0.14
+            + std::sin(static_cast<double>(state.tick) / 4.0) * 0.22
+            + noise * 0.16;
+    } else if (asset.behavior == "factor-noisy") {
+        drift = std::sin(static_cast<double>(state.tick) / 7.0) * 0.28 + noise * 0.50;
+    } else if (asset.behavior == "noise-trap") {
+        drift = noise * 0.90;
+    } else {
+        drift = noise * 0.20;
+    }
+
+    state.fairValue = std::clamp(state.fairValue + drift, std::max(2.0, reference * 0.25), reference * 4.0);
+    return state.fairValue;
+}
+
+void quoteAroundFairValue(GameRoom& room, const AssetConfig& asset, double fairValue, SimulatorTickResult& tickResult) {
+    cancelHouseOrdersForSymbol(room, asset.symbol);
+
+    const Price fair = std::max<Price>(1, static_cast<Price>(std::llround(fairValue)));
+    const Price baseSpread = std::max<Price>(
+        1,
+        asset.behavior == "noise-trap" ? std::max<Price>(2, fair / 35) : std::max<Price>(1, fair / 100));
+    const int levels = asset.behavior == "noise-trap" ? 3 : 5;
+    const Qty baseQuantity = asset.behavior == "noise-trap" ? 22 : 55;
+
+    for (int level = 0; level < levels; ++level) {
+        const Price offset = baseSpread + level;
+        const Qty quantity = baseQuantity + static_cast<Qty>(level * baseQuantity / 2);
+        const Price bid = std::max<Price>(1, fair - offset);
+        const Price ask = fair + offset;
+
+        SubmitResult buy = room.exchange.buy(asset.symbol, HouseTraderId, room.orderIds.next(), bid, quantity);
+        room.accounts.recordTrades(asset.symbol, buy);
+        tickResult.trades += buy.trades.size();
+
+        SubmitResult sell = room.exchange.sell(asset.symbol, HouseTraderId, room.orderIds.next(), ask, quantity);
+        room.accounts.recordTrades(asset.symbol, sell);
+        tickResult.trades += sell.trades.size();
+    }
+}
+
+SimulatorTickResult advanceSinglePlayerSimulator(GameRoom& room, int steps) {
+    SimulatorTickResult result;
+    if (room.mode != RoomMode::Single || !room.houseLiquidity) {
+        return result;
+    }
+
+    result.steps = std::max(1, std::min(steps, 25));
+    for (int step = 0; step < result.steps; ++step) {
+        for (const AssetConfig& asset : room.assets) {
+            SimulatorSymbolState& state = room.simulator[asset.symbol];
+            if (state.fairValue <= 0.0) {
+                state.fairValue = static_cast<double>(asset.referencePrice);
+            }
+
+            quoteAroundFairValue(room, asset, nextFairValue(asset, state), result);
+        }
+    }
+
+    result.symbols.reserve(room.assets.size());
+    for (const AssetConfig& asset : room.assets) {
+        result.symbols.push_back(asset.symbol);
+    }
+
+    return result;
+}
+
 void seedRoom(GameRoom& room) {
+    initializeSimulator(room);
     for (const AssetConfig& asset : room.assets) {
         seedHouseLiquidity(room, asset, room.mode == RoomMode::Single ? 5 : 3, room.mode == RoomMode::Single ? 60 : 25);
     }
@@ -3806,6 +3974,13 @@ RestoreStats restoreFromEvents(RoomStore& rooms, const std::vector<PersistedEven
             continue;
         }
 
+        if (event.eventType == "simulator_tick") {
+            const int steps = static_cast<int>(std::max<std::int64_t>(1, std::min<std::int64_t>(event.quantity, 25)));
+            advanceSinglePlayerSimulator(*game, steps);
+            ++stats.simulatorTicks;
+            continue;
+        }
+
         ++stats.skipped;
     }
 
@@ -4056,6 +4231,7 @@ int main(int argc, char** argv) {
                       << restoreStats.sessions << " session, "
                       << restoreStats.orders << " order, "
                       << restoreStats.cancels << " cancel, "
+                      << restoreStats.simulatorTicks << " simulator, "
                       << restoreStats.skipped << " skipped).\n";
         }
         std::cout << "Press Ctrl+C to stop.\n";

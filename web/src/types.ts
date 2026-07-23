@@ -83,6 +83,13 @@ export interface JoinResult {
   room?: GameRoom;
 }
 
+export interface SimulatorTickResult {
+  advanced: boolean;
+  steps: number;
+  trades: number;
+  symbols: string[];
+}
+
 export interface LeaveResult {
   left: boolean;
   cooldownRemainingSeconds: number;
