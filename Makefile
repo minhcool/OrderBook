@@ -15,7 +15,7 @@ PERF_BIN := $(BUILD_DIR)/orderbook_perf.exe
 API_BIN := $(BUILD_DIR)/orderbook_api.exe
 API_LDLIBS ?= -lws2_32
 
-.PHONY: all test demo perf api-build api clean
+.PHONY: all test demo perf api-build api-test api clean
 
 all: test demo
 
@@ -44,6 +44,9 @@ perf: $(PERF_BIN)
 	$(PERF_BIN)
 
 api-build: $(API_BIN)
+
+api-test: $(API_BIN)
+	powershell -ExecutionPolicy Bypass -File tests/test_api_lobbies.ps1
 
 api: $(API_BIN)
 	$(API_BIN)

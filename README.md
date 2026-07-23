@@ -16,6 +16,8 @@ The project currently provides an in-memory orderbook library with:
 - authenticated open-order, fill-history, and derived-position endpoints
 - public trade tape, last-trade marks, and simple portfolio valuation
 - single-player and competitive game rooms
+- multiple competitive lobbies with independent books and enforced capacities
+- authenticated lobby join/leave membership
 - fictional room assets, including synthetic and masked-real-series profiles
 - room-scoped order books and portfolios
 - coarse-grained mutex protection
@@ -92,6 +94,12 @@ Copy-Item .env.example .env
 npm run dev
 ```
 
+Run the competitive lobby API integration test:
+
+```powershell
+mingw32-make api-test
+```
+
 Remove generated build files:
 
 ```powershell
@@ -143,7 +151,8 @@ For deploying the C++ API server, see [docs/DEPLOY_API.md](docs/DEPLOY_API.md).
 - Backend JWT signature verification is not implemented yet; the current API auth bridge is for development.
 - No durable balances, deposits, withdrawals, margin, or settlement.
 - Portfolio values are estimates from trade cash flow and in-memory last-trade marks.
-- No leaderboard, room clock, news engine, or bot tournament scheduler yet.
+- Competitive lobbies are currently seeded at startup; dynamic lobby creation, ready states, game clocks, and matchmaking are not implemented yet.
+- No leaderboard, news engine, or bot tournament scheduler yet.
 - Masked-real-series assets are only metadata placeholders until a licensed historical data import exists.
 - No persistence or event log.
 - No tick size or lot size validation.

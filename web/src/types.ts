@@ -2,6 +2,11 @@ export type Side = "buy" | "sell";
 export type OrderMode = "limit" | "market" | "ioc" | "fok";
 export type RoomMode = "single" | "competitive";
 
+export interface MarketScope {
+  roomId: string;
+  lobbyId?: string;
+}
+
 export interface RoomAsset {
   symbol: string;
   displayName: string;
@@ -20,6 +25,21 @@ export interface GameRoom {
   maxParticipants: number;
   houseLiquidity: boolean;
   assets: RoomAsset[];
+}
+
+export interface GameLobby {
+  id: string;
+  name: string;
+  roomId: string;
+  status: "open" | "full";
+  participantCount: number;
+  capacity: number;
+  spotsRemaining: number;
+}
+
+export interface LobbyMembership {
+  joined: boolean;
+  traderId: number;
 }
 
 export interface Trade {

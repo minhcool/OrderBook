@@ -28,8 +28,9 @@ Stop it with `Ctrl+C`.
 - The server stores all state in memory.
 - Restarting the server clears all books.
 - One symbol maps to one orderbook.
-- The API server starts with a backward-compatible `sandbox` room and game rooms for single-player and competitive trading.
-- Old routes like `/book/BTC-USD` use the `sandbox` room. Game routes use `/rooms/{roomId}/...`.
+- The API server starts with a backward-compatible `sandbox` room and game definitions for single-player and competitive trading.
+- A competitive room has multiple independent lobbies. Each lobby owns its own order books, trade history, accounts, and participant capacity.
+- Old routes like `/book/BTC-USD` use the `sandbox` room. Single-player routes use `/rooms/{roomId}/...`; competitive market routes use `/lobbies/{lobbyId}/...`.
 - New order IDs are assigned by the server. Clients pass `orderId` only when replacing or canceling an existing order.
 - Open orders, fills, and positions are also stored/read in memory.
 - Price marks are based on the public trade tape. The current portfolio mark uses the last trade price; `/prices` also exposes VWAPs over the last 3, 5, and 10 trades.
@@ -90,11 +91,48 @@ Response:
 
 The asset `source` may say `masked-real-series`, but the API does not reveal the real-world backing symbol.
 
+Competitive lobbies:
+
+```http
+GET /lobbies
+GET /lobbies/{lobbyId}
+GET /rooms/{roomId}/lobbies
+```
+
+Response:
+
+```json
+{
+  "lobbies": [
+    {
+      "id": "aurora-open-10",
+      "name": "Aurora Open 10",
+      "roomId": "comp-aurora",
+      "status": "open",
+      "participantCount": 0,
+      "capacity": 10,
+      "spotsRemaining": 10
+    }
+  ]
+}
+```
+
+Joining and leaving require a Clerk bearer token:
+
+```http
+GET  /lobbies/{lobbyId}/membership
+POST /lobbies/{lobbyId}/join
+POST /lobbies/{lobbyId}/leave
+```
+
+Joining is idempotent. A full lobby returns `409`. Leaving cancels that trader's resting orders in the lobby. Public books and market data can be inspected without joining, while order and `/me` endpoints return `403` until the authenticated trader joins.
+
 Known symbols:
 
 ```http
 GET /symbols
 GET /rooms/{roomId}/symbols
+GET /lobbies/{lobbyId}/symbols
 ```
 
 Response:
@@ -110,6 +148,8 @@ GET /prices
 GET /prices/{symbol}
 GET /rooms/{roomId}/prices
 GET /rooms/{roomId}/prices/{symbol}
+GET /lobbies/{lobbyId}/prices
+GET /lobbies/{lobbyId}/prices/{symbol}
 ```
 
 Response:

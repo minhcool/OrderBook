@@ -13,6 +13,7 @@
 #include <mutex>
 #include <optional>
 #include <regex>
+#include <set>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -478,18 +479,75 @@ struct ParsedRoomPath {
     std::string nestedPath;
 };
 
+enum class LobbyJoinResult {
+    Joined,
+    AlreadyJoined,
+    Full,
+};
+
+struct CompetitiveLobby {
+    std::string id;
+    std::string name;
+    std::string roomId;
+    int capacity = 0;
+    std::unique_ptr<GameRoom> game;
+
+    LobbyJoinResult join(TraderId traderId) {
+        std::lock_guard<std::mutex> lock(participantMutex);
+        if (participantIds.contains(traderId)) {
+            return LobbyJoinResult::AlreadyJoined;
+        }
+
+        if (participantIds.size() >= static_cast<std::size_t>(capacity)) {
+            return LobbyJoinResult::Full;
+        }
+
+        participantIds.insert(traderId);
+        return LobbyJoinResult::Joined;
+    }
+
+    bool leave(TraderId traderId) {
+        std::lock_guard<std::mutex> lock(participantMutex);
+        return participantIds.erase(traderId) > 0;
+    }
+
+    bool contains(TraderId traderId) const {
+        std::lock_guard<std::mutex> lock(participantMutex);
+        return participantIds.contains(traderId);
+    }
+
+    std::size_t participantCount() const {
+        std::lock_guard<std::mutex> lock(participantMutex);
+        return participantIds.size();
+    }
+
+private:
+    mutable std::mutex participantMutex;
+    std::set<TraderId> participantIds;
+};
+
+struct ParsedLobbyPath {
+    std::string lobbyId;
+    std::string nestedPath;
+};
+
 class RoomStore {
 public:
     RoomStore();
 
     GameRoom* find(const std::string& roomId);
+    CompetitiveLobby* findLobby(const std::string& lobbyId);
     GameRoom& defaultRoom();
     std::vector<const GameRoom*> rooms() const;
+    std::vector<const CompetitiveLobby*> lobbies() const;
+    std::vector<const CompetitiveLobby*> lobbiesForRoom(const std::string& roomId) const;
 
 private:
     void addRoom(std::unique_ptr<GameRoom> room);
+    void addLobby(std::unique_ptr<CompetitiveLobby> lobby);
 
     std::map<std::string, std::unique_ptr<GameRoom>> roomById;
+    std::map<std::string, std::unique_ptr<CompetitiveLobby>> lobbyById;
     std::string defaultRoomId = "sandbox";
 };
 
@@ -769,6 +827,40 @@ std::string serializeRooms(const std::vector<const GameRoom*>& rooms) {
         }
 
         out << serializeRoom(*rooms[i]);
+    }
+
+    out << "]}";
+    return out.str();
+}
+
+std::string serializeLobby(const CompetitiveLobby& lobby) {
+    const std::size_t participantCount = lobby.participantCount();
+    const std::size_t capacity = static_cast<std::size_t>(lobby.capacity);
+    const std::size_t spotsRemaining = capacity > participantCount ? capacity - participantCount : 0;
+
+    std::ostringstream out;
+    out << "{"
+        << "\"id\":\"" << jsonEscape(lobby.id) << "\","
+        << "\"name\":\"" << jsonEscape(lobby.name) << "\","
+        << "\"roomId\":\"" << jsonEscape(lobby.roomId) << "\","
+        << "\"status\":\"" << (spotsRemaining == 0 ? "full" : "open") << "\","
+        << "\"participantCount\":" << participantCount << ","
+        << "\"capacity\":" << lobby.capacity << ","
+        << "\"spotsRemaining\":" << spotsRemaining
+        << "}";
+    return out.str();
+}
+
+std::string serializeLobbies(const std::vector<const CompetitiveLobby*>& lobbies) {
+    std::ostringstream out;
+    out << "{\"lobbies\":[";
+
+    for (std::size_t i = 0; i < lobbies.size(); ++i) {
+        if (i > 0) {
+            out << ",";
+        }
+
+        out << serializeLobby(*lobbies[i]);
     }
 
     out << "]}";
@@ -1269,6 +1361,21 @@ std::optional<ParsedRoomPath> parseRoomPath(const std::string& path) {
     return ParsedRoomPath{urlDecode(path.substr(roomStart, slash - roomStart)), path.substr(slash)};
 }
 
+std::optional<ParsedLobbyPath> parseLobbyPath(const std::string& path) {
+    const std::string prefix = "/lobbies/";
+    if (path.rfind(prefix, 0) != 0 || path.size() <= prefix.size()) {
+        return std::nullopt;
+    }
+
+    const std::size_t lobbyStart = prefix.size();
+    const std::size_t slash = path.find('/', lobbyStart);
+    if (slash == std::string::npos) {
+        return ParsedLobbyPath{urlDecode(path.substr(lobbyStart)), ""};
+    }
+
+    return ParsedLobbyPath{urlDecode(path.substr(lobbyStart, slash - lobbyStart)), path.substr(slash)};
+}
+
 HttpResponse jsonResponse(int status, const std::string& body) {
     return {status, "application/json", body};
 }
@@ -1469,6 +1576,78 @@ HttpResponse routeRoom(GameRoom& room, const HttpRequest& request) {
     return jsonResponse(405, jsonError("only GET, POST, and OPTIONS are supported"));
 }
 
+void cancelTraderOrders(Exchange& exchange, TraderId traderId) {
+    for (const std::string& symbol : exchange.symbols()) {
+        const std::vector<OpenOrder> orders = exchange.openOrders(symbol, traderId);
+        for (const OpenOrder& order : orders) {
+            exchange.cancelForTrader(symbol, traderId, order.orderId);
+        }
+    }
+}
+
+HttpResponse routeLobby(CompetitiveLobby& lobby, const HttpRequest& request) {
+    const auto [path, query] = splitQuery(request.path);
+
+    if (request.method == "OPTIONS") {
+        return jsonResponse(200, "{}");
+    }
+
+    try {
+        if (request.method == "GET" && path == "/membership") {
+            const TraderId traderId = authenticatedTraderId(request);
+            return jsonResponse(
+                200,
+                std::string("{\"joined\":") + (lobby.contains(traderId) ? "true" : "false")
+                    + ",\"traderId\":" + std::to_string(traderId) + "}");
+        }
+
+        if (request.method == "POST" && path == "/join") {
+            const TraderId traderId = authenticatedTraderId(request);
+            const LobbyJoinResult result = lobby.join(traderId);
+            if (result == LobbyJoinResult::Full) {
+                return jsonResponse(409, jsonError("lobby is full"));
+            }
+
+            return jsonResponse(
+                200,
+                std::string("{\"joined\":true,\"alreadyJoined\":")
+                    + (result == LobbyJoinResult::AlreadyJoined ? "true" : "false")
+                    + ",\"lobby\":" + serializeLobby(lobby) + "}");
+        }
+
+        if (request.method == "POST" && path == "/leave") {
+            const TraderId traderId = authenticatedTraderId(request);
+            const bool left = lobby.leave(traderId);
+            if (left) {
+                cancelTraderOrders(lobby.game->exchange, traderId);
+            }
+
+            return jsonResponse(
+                200,
+                std::string("{\"left\":") + (left ? "true" : "false")
+                    + ",\"lobby\":" + serializeLobby(lobby) + "}");
+        }
+
+        const bool requiresMembership =
+            request.method == "POST"
+            || (request.method == "GET" && path.rfind("/me", 0) == 0);
+        if (requiresMembership) {
+            const TraderId traderId = authenticatedTraderId(request);
+            if (!lobby.contains(traderId)) {
+                return jsonResponse(403, jsonError("join this lobby before trading"));
+            }
+        }
+    } catch (const AuthError& ex) {
+        return jsonResponse(401, jsonError(ex.what()));
+    } catch (const std::exception& ex) {
+        return jsonResponse(400, jsonError(ex.what()));
+    }
+
+    HttpRequest scopedRequest = request;
+    scopedRequest.path = path + (query.empty() ? "" : "?" + query);
+    return routeRoom(*lobby.game, scopedRequest);
+}
+
 HttpResponse route(RoomStore& rooms, const HttpRequest& request) {
     const auto [path, query] = splitQuery(request.path);
 
@@ -1483,6 +1662,10 @@ HttpResponse route(RoomStore& rooms, const HttpRequest& request) {
 
         if (path == "/rooms") {
             return jsonResponse(200, serializeRooms(rooms.rooms()));
+        }
+
+        if (path == "/lobbies") {
+            return jsonResponse(200, serializeLobbies(rooms.lobbies()));
         }
     }
 
@@ -1501,9 +1684,41 @@ HttpResponse route(RoomStore& rooms, const HttpRequest& request) {
             return jsonResponse(405, jsonError("room detail only supports GET"));
         }
 
+        if (roomPath->nestedPath == "/lobbies") {
+            if (request.method == "GET") {
+                return jsonResponse(200, serializeLobbies(rooms.lobbiesForRoom(room->id)));
+            }
+
+            return jsonResponse(405, jsonError("room lobbies only support GET"));
+        }
+
+        if (room->mode == RoomMode::Competitive) {
+            return jsonResponse(409, jsonError("select a competitive lobby"));
+        }
+
         HttpRequest scopedRequest = request;
         scopedRequest.path = roomPath->nestedPath + (query.empty() ? "" : "?" + query);
         return routeRoom(*room, scopedRequest);
+    }
+
+    const std::optional<ParsedLobbyPath> lobbyPath = parseLobbyPath(path);
+    if (lobbyPath) {
+        CompetitiveLobby* lobby = rooms.findLobby(lobbyPath->lobbyId);
+        if (lobby == nullptr) {
+            return jsonResponse(404, jsonError("unknown lobby"));
+        }
+
+        if (lobbyPath->nestedPath.empty()) {
+            if (request.method == "GET") {
+                return jsonResponse(200, serializeLobby(*lobby));
+            }
+
+            return jsonResponse(405, jsonError("lobby detail only supports GET"));
+        }
+
+        HttpRequest scopedRequest = request;
+        scopedRequest.path = lobbyPath->nestedPath + (query.empty() ? "" : "?" + query);
+        return routeLobby(*lobby, scopedRequest);
     }
 
     return routeRoom(rooms.defaultRoom(), request);
@@ -1712,10 +1927,40 @@ std::unique_ptr<GameRoom> makeCompetitiveRoom() {
     return room;
 }
 
+std::unique_ptr<CompetitiveLobby> makeCompetitiveLobby(
+    const GameRoom& room,
+    const std::string& lobbyId,
+    const std::string& lobbyName,
+    int capacity) {
+    auto game = std::make_unique<GameRoom>();
+    game->id = lobbyId;
+    game->name = lobbyName;
+    game->mode = room.mode;
+    game->difficulty = room.difficulty;
+    game->startingCash = room.startingCash;
+    game->maxParticipants = capacity;
+    game->houseLiquidity = room.houseLiquidity;
+    game->assets = room.assets;
+    seedRoom(*game);
+
+    auto lobby = std::make_unique<CompetitiveLobby>();
+    lobby->id = lobbyId;
+    lobby->name = lobbyName;
+    lobby->roomId = room.id;
+    lobby->capacity = capacity;
+    lobby->game = std::move(game);
+    return lobby;
+}
+
 RoomStore::RoomStore() {
     addRoom(makeSandboxRoom());
     addRoom(makeSinglePlayerRoom());
-    addRoom(makeCompetitiveRoom());
+
+    std::unique_ptr<GameRoom> competitiveRoom = makeCompetitiveRoom();
+    addLobby(makeCompetitiveLobby(*competitiveRoom, "aurora-open-10", "Aurora Open 10", 10));
+    addLobby(makeCompetitiveLobby(*competitiveRoom, "aurora-open-15", "Aurora Open 15", 15));
+    addLobby(makeCompetitiveLobby(*competitiveRoom, "aurora-open-20", "Aurora Open 20", 20));
+    addRoom(std::move(competitiveRoom));
 }
 
 void RoomStore::addRoom(std::unique_ptr<GameRoom> room) {
@@ -1723,9 +1968,23 @@ void RoomStore::addRoom(std::unique_ptr<GameRoom> room) {
     roomById[id] = std::move(room);
 }
 
+void RoomStore::addLobby(std::unique_ptr<CompetitiveLobby> lobby) {
+    const std::string id = lobby->id;
+    lobbyById[id] = std::move(lobby);
+}
+
 GameRoom* RoomStore::find(const std::string& roomId) {
     const auto it = roomById.find(roomId);
     if (it == roomById.end()) {
+        return nullptr;
+    }
+
+    return it->second.get();
+}
+
+CompetitiveLobby* RoomStore::findLobby(const std::string& lobbyId) {
+    const auto it = lobbyById.find(lobbyId);
+    if (it == lobbyById.end()) {
         return nullptr;
     }
 
@@ -1748,6 +2007,31 @@ std::vector<const GameRoom*> RoomStore::rooms() const {
     for (const auto& [id, room] : roomById) {
         (void)id;
         result.push_back(room.get());
+    }
+
+    return result;
+}
+
+std::vector<const CompetitiveLobby*> RoomStore::lobbies() const {
+    std::vector<const CompetitiveLobby*> result;
+    result.reserve(lobbyById.size());
+
+    for (const auto& [id, lobby] : lobbyById) {
+        (void)id;
+        result.push_back(lobby.get());
+    }
+
+    return result;
+}
+
+std::vector<const CompetitiveLobby*> RoomStore::lobbiesForRoom(const std::string& roomId) const {
+    std::vector<const CompetitiveLobby*> result;
+
+    for (const auto& [id, lobby] : lobbyById) {
+        (void)id;
+        if (lobby->roomId == roomId) {
+            result.push_back(lobby.get());
+        }
     }
 
     return result;

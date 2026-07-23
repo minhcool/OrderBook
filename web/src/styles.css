@@ -43,7 +43,8 @@ button:hover {
 }
 
 button:disabled,
-input:disabled {
+input:disabled,
+select:disabled {
   cursor: not-allowed;
   opacity: 0.55;
 }
@@ -164,7 +165,7 @@ select:focus {
   align-items: end;
   display: grid;
   gap: 12px;
-  grid-template-columns: minmax(220px, 1.4fr) minmax(170px, 0.8fr) minmax(140px, 0.7fr) auto minmax(180px, 1fr);
+  grid-template-columns: minmax(220px, 1.25fr) minmax(160px, 0.8fr) minmax(170px, 0.9fr) minmax(120px, 0.6fr) auto;
   padding: 14px;
 }
 
@@ -182,6 +183,7 @@ label {
   display: flex;
   flex-wrap: wrap;
   gap: 8px;
+  grid-column: 1 / -1;
 }
 
 .room-meta {
@@ -200,6 +202,22 @@ label {
   font-weight: 750;
   padding: 6px 9px;
   text-transform: uppercase;
+}
+
+.lobby-action {
+  margin-left: auto;
+  min-height: 30px;
+  padding: 5px 10px;
+}
+
+.lobby-action.join {
+  background: #172033;
+  border-color: #172033;
+  color: #ffffff;
+}
+
+.lobby-action.leave {
+  color: #b64236;
 }
 
 .symbols button {

@@ -1,12 +1,27 @@
 import React from "react";
 import ReactDOM from "react-dom/client";
 import { ClerkProvider, Show, SignInButton, SignUpButton, UserButton, useAuth, useUser } from "@clerk/react";
-import { Activity, CircleOff, Eraser, PlugZap, RefreshCw, Replace, Send, Server, Wifi, WifiOff } from "lucide-react";
+import {
+  Activity,
+  CircleOff,
+  Eraser,
+  LogOut,
+  PlugZap,
+  RefreshCw,
+  Replace,
+  Send,
+  Server,
+  UserPlus,
+  Wifi,
+  WifiOff
+} from "lucide-react";
 
 import {
   cancelOrder,
   fetchBook,
   fetchFills,
+  fetchLobbies,
+  fetchLobbyMembership,
   fetchMe,
   fetchOpenOrders,
   fetchPortfolio,
@@ -14,13 +29,18 @@ import {
   fetchRooms,
   fetchSymbols,
   health,
+  joinLobby,
+  leaveLobby,
   replaceOrder,
   submitOrder
 } from "./api";
 import type {
   BookSnapshot,
   FillRecord,
+  GameLobby,
   GameRoom,
+  LobbyMembership,
+  MarketScope,
   MarketPrice,
   MeSummary,
   OpenOrder,
@@ -34,6 +54,7 @@ import "./styles.css";
 const DEFAULT_API_BASE = import.meta.env.VITE_ORDERBOOK_API_URL ?? "http://localhost:8080";
 const CLERK_PUBLISHABLE_KEY = import.meta.env.VITE_CLERK_PUBLISHABLE_KEY;
 const DEFAULT_ROOM_ID = "solo-alpha";
+const DEFAULT_LOBBY_ID = "aurora-open-10";
 const DEFAULT_SYMBOL = "NOVA";
 
 interface ActivityItem {
@@ -75,6 +96,9 @@ function App() {
   const [apiBase, setApiBase] = React.useState(() => localStorage.getItem("orderbook.apiBase") ?? DEFAULT_API_BASE);
   const [roomId, setRoomId] = React.useState(() => localStorage.getItem("orderbook.roomId") ?? DEFAULT_ROOM_ID);
   const [rooms, setRooms] = React.useState<GameRoom[]>([]);
+  const [lobbyId, setLobbyId] = React.useState(() => localStorage.getItem("orderbook.lobbyId") ?? DEFAULT_LOBBY_ID);
+  const [lobbies, setLobbies] = React.useState<GameLobby[]>([]);
+  const [membership, setMembership] = React.useState<LobbyMembership | null>(null);
   const [symbol, setSymbol] = React.useState(DEFAULT_SYMBOL);
   const [symbols, setSymbols] = React.useState<string[]>([]);
   const [book, setBook] = React.useState<BookSnapshot>({ symbol: DEFAULT_SYMBOL, bids: [], asks: [] });
@@ -98,6 +122,15 @@ function App() {
   const [replaceQuantity, setReplaceQuantity] = React.useState("5");
   const [cancelId, setCancelId] = React.useState("1001");
 
+  const selectedRoom = rooms.find((room) => room.id === roomId);
+  const selectedLobby = lobbies.find((lobby) => lobby.id === lobbyId);
+  const isCompetitive = selectedRoom?.mode === "competitive";
+  const activeScope: MarketScope = {
+    roomId,
+    ...(isCompetitive ? { lobbyId } : {})
+  };
+  const canTrade = Boolean(isSignedIn && selectedRoom) && (!isCompetitive || membership?.joined === true);
+
   const pushActivity = React.useCallback((title: string, detail: string, ok: boolean) => {
     setActivity((items) => [{ id: Date.now() + Math.random(), title, detail, ok }, ...items].slice(0, 8));
   }, []);
@@ -119,17 +152,43 @@ function App() {
     setLoading(true);
     localStorage.setItem("orderbook.apiBase", apiBase);
     localStorage.setItem("orderbook.roomId", roomId);
+    localStorage.setItem("orderbook.lobbyId", lobbyId);
 
     try {
       await health(apiBase);
-      const [nextRooms, nextSymbols] = await Promise.all([fetchRooms(apiBase), fetchSymbols(apiBase, roomId)]);
+      const nextRooms = await fetchRooms(apiBase);
+      const activeRoom = nextRooms.find((room) => room.id === roomId) ?? nextRooms[0];
+      if (!activeRoom) {
+        throw new Error("API returned no game rooms");
+      }
+
+      const nextLobbies = activeRoom.mode === "competitive"
+        ? await fetchLobbies(apiBase, activeRoom.id)
+        : [];
+      const activeLobby = activeRoom.mode === "competitive"
+        ? nextLobbies.find((lobby) => lobby.id === lobbyId) ?? nextLobbies[0]
+        : undefined;
+      if (activeRoom.mode === "competitive" && !activeLobby) {
+        throw new Error("This competitive room has no available lobbies");
+      }
+
+      const scope: MarketScope = {
+        roomId: activeRoom.id,
+        ...(activeLobby ? { lobbyId: activeLobby.id } : {})
+      };
+      const nextSymbols = await fetchSymbols(apiBase, scope);
       const activeSymbol = nextSymbols.includes(symbol) ? symbol : nextSymbols[0] ?? symbol;
       const [nextBook, nextMarketPrice] = await Promise.all([
-        fetchBook(apiBase, roomId, activeSymbol, 10),
-        fetchPrice(apiBase, roomId, activeSymbol)
+        fetchBook(apiBase, scope, activeSymbol, 10),
+        fetchPrice(apiBase, scope, activeSymbol)
       ]);
 
       setRooms(nextRooms);
+      setRoomId(activeRoom.id);
+      setLobbies(nextLobbies);
+      if (activeLobby) {
+        setLobbyId(activeLobby.id);
+      }
       setSymbol(activeSymbol);
       setBook(nextBook);
       setSymbols(nextSymbols);
@@ -141,14 +200,19 @@ function App() {
     } finally {
       setLoading(false);
     }
-  }, [apiBase, pushActivity, roomId, symbol]);
+  }, [apiBase, lobbyId, pushActivity, roomId, symbol]);
 
   const refreshAccount = React.useCallback(async () => {
     if (!isLoaded || !isSignedIn) {
+      setMembership(null);
       setMe(null);
       setOpenOrders([]);
       setFills([]);
       setPortfolio(null);
+      return;
+    }
+
+    if (rooms.length === 0 || (isCompetitive && !lobbyId)) {
       return;
     }
 
@@ -158,11 +222,29 @@ function App() {
         throw new Error("Could not read Clerk session token");
       }
 
+      if (isCompetitive) {
+        const nextMembership = await fetchLobbyMembership(apiBase, lobbyId, token);
+        setMembership(nextMembership);
+        if (!nextMembership.joined) {
+          setMe(null);
+          setOpenOrders([]);
+          setFills([]);
+          setPortfolio(null);
+          return;
+        }
+      } else {
+        setMembership(null);
+      }
+
+      const scope: MarketScope = {
+        roomId,
+        ...(isCompetitive ? { lobbyId } : {})
+      };
       const [nextMe, nextOpenOrders, nextFills, nextPortfolio] = await Promise.all([
-        fetchMe(apiBase, roomId, token),
-        fetchOpenOrders(apiBase, roomId, token),
-        fetchFills(apiBase, roomId, token),
-        fetchPortfolio(apiBase, roomId, token)
+        fetchMe(apiBase, scope, token),
+        fetchOpenOrders(apiBase, scope, token),
+        fetchFills(apiBase, scope, token),
+        fetchPortfolio(apiBase, scope, token)
       ]);
 
       setMe(nextMe);
@@ -172,7 +254,7 @@ function App() {
     } catch (error) {
       pushActivity("Account refresh failed", error instanceof Error ? error.message : "Request failed", false);
     }
-  }, [apiBase, getToken, isLoaded, isSignedIn, pushActivity, roomId]);
+  }, [apiBase, getToken, isCompetitive, isLoaded, isSignedIn, lobbyId, pushActivity, roomId, rooms.length]);
 
   const refreshAll = React.useCallback(async () => {
     await Promise.all([refresh(), refreshAccount()]);
@@ -197,7 +279,7 @@ function App() {
 
     try {
       const token = await requireToken();
-      const result = await submitOrder(apiBase, roomId, token, side, mode, payload);
+      const result = await submitOrder(apiBase, activeScope, token, side, mode, payload);
       pushActivity(`${mode.toUpperCase()} ${side.toUpperCase()} #${result.orderId}`, resultSummary(result), result.accepted);
       if (result.accepted && result.restingQuantity > 0) {
         setReplaceSide(side);
@@ -222,7 +304,7 @@ function App() {
 
     try {
       const token = await requireToken();
-      const result = await replaceOrder(apiBase, roomId, token, replaceSide, payload);
+      const result = await replaceOrder(apiBase, activeScope, token, replaceSide, payload);
       pushActivity(`REPLACE ${replaceSide.toUpperCase()} #${payload.orderId}`, resultSummary(result), result.accepted);
       await refreshAll();
     } catch (error) {
@@ -235,7 +317,7 @@ function App() {
 
     try {
       const token = await requireToken();
-      const result = await cancelOrder(apiBase, roomId, token, symbol, toNumber(cancelId));
+      const result = await cancelOrder(apiBase, activeScope, token, symbol, toNumber(cancelId));
       pushActivity(`CANCEL #${cancelId}`, result.canceled ? "canceled" : "order not found", result.canceled);
       await refreshAll();
     } catch (error) {
@@ -243,9 +325,38 @@ function App() {
     }
   }
 
+  async function handleJoinLobby() {
+    try {
+      const token = await requireToken();
+      const result = await joinLobby(apiBase, lobbyId, token);
+      setMembership({ joined: result.joined, traderId: 0 });
+      setLobbies((items) => items.map((item) => item.id === result.lobby.id ? result.lobby : item));
+      pushActivity("Lobby joined", `${result.lobby.name}: ${result.lobby.participantCount}/${result.lobby.capacity}`, true);
+      await refreshAccount();
+    } catch (error) {
+      pushActivity("Join failed", error instanceof Error ? error.message : "Request failed", false);
+    }
+  }
+
+  async function handleLeaveLobby() {
+    try {
+      const token = await requireToken();
+      const result = await leaveLobby(apiBase, lobbyId, token);
+      setMembership(null);
+      setLobbies((items) => items.map((item) => item.id === result.lobby.id ? result.lobby : item));
+      setMe(null);
+      setOpenOrders([]);
+      setFills([]);
+      setPortfolio(null);
+      pushActivity("Lobby left", "Your resting orders in this lobby were canceled", true);
+      await refresh();
+    } catch (error) {
+      pushActivity("Leave failed", error instanceof Error ? error.message : "Request failed", false);
+    }
+  }
+
   const spread = book.bids.length > 0 && book.asks.length > 0 ? book.asks[0].price - book.bids[0].price : null;
   const signedInName = user?.primaryEmailAddress?.emailAddress ?? user?.fullName ?? user?.id ?? "Signed in";
-  const selectedRoom = rooms.find((room) => room.id === roomId);
   const selectedAsset = selectedRoom?.assets.find((asset) => asset.symbol === symbol);
 
   return (
@@ -285,13 +396,40 @@ function App() {
         </label>
         <label>
           Room
-          <select value={roomId} onChange={(event) => setRoomId(event.target.value)}>
+          <select
+            value={roomId}
+            onChange={(event) => {
+              setRoomId(event.target.value);
+              setMembership(null);
+            }}
+          >
             {rooms.length === 0 ? (
               <option value={roomId}>{roomId}</option>
             ) : (
               rooms.map((room) => (
                 <option key={room.id} value={room.id}>
                   {room.name}
+                </option>
+              ))
+            )}
+          </select>
+        </label>
+        <label>
+          Lobby
+          <select
+            value={isCompetitive ? lobbyId : ""}
+            disabled={!isCompetitive}
+            onChange={(event) => {
+              setLobbyId(event.target.value);
+              setMembership(null);
+            }}
+          >
+            {!isCompetitive ? (
+              <option value="">Personal session</option>
+            ) : (
+              lobbies.map((lobby) => (
+                <option key={lobby.id} value={lobby.id}>
+                  {lobby.name} ({lobby.participantCount}/{lobby.capacity})
                 </option>
               ))
             )}
@@ -317,6 +455,30 @@ function App() {
           <span>{selectedRoom?.difficulty ?? "dev"}</span>
           <span>{selectedAsset?.behavior ?? "manual"}</span>
           <span>{selectedAsset?.source ?? "sandbox"}</span>
+          {selectedLobby ? (
+            <>
+              <span>{selectedLobby.participantCount}/{selectedLobby.capacity} players</span>
+              <span>{selectedLobby.status}</span>
+            </>
+          ) : null}
+          {isCompetitive && isSignedIn ? (
+            membership?.joined ? (
+              <button type="button" className="lobby-action leave" onClick={() => void handleLeaveLobby()}>
+                <LogOut size={16} />
+                Leave lobby
+              </button>
+            ) : (
+              <button
+                type="button"
+                className="lobby-action join"
+                disabled={selectedLobby?.status === "full"}
+                onClick={() => void handleJoinLobby()}
+              >
+                <UserPlus size={16} />
+                {selectedLobby?.status === "full" ? "Lobby full" : "Join lobby"}
+              </button>
+            )
+          ) : null}
         </div>
       </section>
 
@@ -354,6 +516,12 @@ function App() {
                 <span>Orders are tied to your Clerk user. Trader ID is assigned by the API.</span>
               </div>
             </Show>
+            {isSignedIn && isCompetitive && !membership?.joined ? (
+              <div className="auth-callout">
+                <strong>Join this lobby to trade</strong>
+                <span>You can inspect its market first. Capacity is enforced by the API.</span>
+              </div>
+            ) : null}
             <Segmented<Side> value={side} onChange={setSide} options={[
               { label: "Buy", value: "buy" },
               { label: "Sell", value: "sell" }
@@ -372,7 +540,7 @@ function App() {
               Quantity
               <input inputMode="numeric" value={quantity} onChange={(event) => setQuantity(event.target.value)} />
             </label>
-            <button className={`primary ${side}`} type="submit" disabled={!isSignedIn}>
+            <button className={`primary ${side}`} type="submit" disabled={!canTrade}>
               <Send size={17} />
               Submit
             </button>
@@ -408,7 +576,7 @@ function App() {
               Quantity
               <input inputMode="numeric" value={replaceQuantity} onChange={(event) => setReplaceQuantity(event.target.value)} />
             </label>
-            <button type="submit" disabled={!isSignedIn}>
+            <button type="submit" disabled={!canTrade}>
               <Replace size={17} />
               Replace
             </button>
@@ -419,7 +587,7 @@ function App() {
               Cancel ID
               <input inputMode="numeric" value={cancelId} onChange={(event) => setCancelId(event.target.value)} />
             </label>
-            <button type="submit" className="danger" disabled={!isSignedIn}>
+            <button type="submit" className="danger" disabled={!canTrade}>
               <CircleOff size={17} />
               Cancel
             </button>

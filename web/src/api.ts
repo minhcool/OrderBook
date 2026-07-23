@@ -1,7 +1,10 @@
 import type {
   BookSnapshot,
   FillRecord,
+  GameLobby,
   GameRoom,
+  LobbyMembership,
+  MarketScope,
   MarketPrice,
   MarketTradeRecord,
   MeSummary,
@@ -48,8 +51,12 @@ export async function health(apiBase: string): Promise<{ ok: boolean }> {
   return requestJson(`${apiBase}/health`);
 }
 
-function scopedBase(apiBase: string, roomId?: string): string {
-  return roomId ? `${apiBase}/rooms/${encodeURIComponent(roomId)}` : apiBase;
+function scopedBase(apiBase: string, scope?: MarketScope): string {
+  if (scope?.lobbyId) {
+    return `${apiBase}/lobbies/${encodeURIComponent(scope.lobbyId)}`;
+  }
+
+  return scope?.roomId ? `${apiBase}/rooms/${encodeURIComponent(scope.roomId)}` : apiBase;
 }
 
 export async function fetchRooms(apiBase: string): Promise<GameRoom[]> {
@@ -57,27 +64,57 @@ export async function fetchRooms(apiBase: string): Promise<GameRoom[]> {
   return data.rooms;
 }
 
-export async function fetchSymbols(apiBase: string, roomId?: string): Promise<string[]> {
-  const data = await requestJson<{ symbols: string[] }>(`${scopedBase(apiBase, roomId)}/symbols`);
+export async function fetchLobbies(apiBase: string, roomId?: string): Promise<GameLobby[]> {
+  const endpoint = roomId
+    ? `${apiBase}/rooms/${encodeURIComponent(roomId)}/lobbies`
+    : `${apiBase}/lobbies`;
+  const data = await requestJson<{ lobbies: GameLobby[] }>(endpoint);
+  return data.lobbies;
+}
+
+export async function fetchLobbyMembership(apiBase: string, lobbyId: string, token: string): Promise<LobbyMembership> {
+  return requestJson(`${apiBase}/lobbies/${encodeURIComponent(lobbyId)}/membership`, {
+    headers: authHeaders(token)
+  });
+}
+
+export async function joinLobby(apiBase: string, lobbyId: string, token: string): Promise<{ joined: boolean; lobby: GameLobby }> {
+  return requestJson(`${apiBase}/lobbies/${encodeURIComponent(lobbyId)}/join`, {
+    method: "POST",
+    headers: authHeaders(token),
+    body: "{}"
+  });
+}
+
+export async function leaveLobby(apiBase: string, lobbyId: string, token: string): Promise<{ left: boolean; lobby: GameLobby }> {
+  return requestJson(`${apiBase}/lobbies/${encodeURIComponent(lobbyId)}/leave`, {
+    method: "POST",
+    headers: authHeaders(token),
+    body: "{}"
+  });
+}
+
+export async function fetchSymbols(apiBase: string, scope?: MarketScope): Promise<string[]> {
+  const data = await requestJson<{ symbols: string[] }>(`${scopedBase(apiBase, scope)}/symbols`);
   return data.symbols;
 }
 
-export async function fetchBook(apiBase: string, roomId: string | undefined, symbol: string, depth: number): Promise<BookSnapshot> {
-  return requestJson(`${scopedBase(apiBase, roomId)}/book/${encodeURIComponent(symbol)}?depth=${depth}`);
+export async function fetchBook(apiBase: string, scope: MarketScope | undefined, symbol: string, depth: number): Promise<BookSnapshot> {
+  return requestJson(`${scopedBase(apiBase, scope)}/book/${encodeURIComponent(symbol)}?depth=${depth}`);
 }
 
-export async function fetchPrice(apiBase: string, roomId: string | undefined, symbol: string): Promise<MarketPrice> {
-  return requestJson(`${scopedBase(apiBase, roomId)}/prices/${encodeURIComponent(symbol)}`);
+export async function fetchPrice(apiBase: string, scope: MarketScope | undefined, symbol: string): Promise<MarketPrice> {
+  return requestJson(`${scopedBase(apiBase, scope)}/prices/${encodeURIComponent(symbol)}`);
 }
 
 export async function fetchMarketTrades(
   apiBase: string,
-  roomId: string | undefined,
+  scope: MarketScope | undefined,
   symbol: string,
   limit = 25
 ): Promise<MarketTradeRecord[]> {
   const data = await requestJson<{ trades: MarketTradeRecord[] }>(
-    `${scopedBase(apiBase, roomId)}/trades/${encodeURIComponent(symbol)}?limit=${limit}`
+    `${scopedBase(apiBase, scope)}/trades/${encodeURIComponent(symbol)}?limit=${limit}`
   );
   return data.trades;
 }
@@ -92,13 +129,13 @@ function endpointFor(side: Side, mode: OrderMode): string {
 
 export async function submitOrder(
   apiBase: string,
-  roomId: string | undefined,
+  scope: MarketScope | undefined,
   token: string,
   side: Side,
   mode: OrderMode,
   order: NewOrderRequest
 ): Promise<SubmitResult> {
-  return requestJson(`${scopedBase(apiBase, roomId)}${endpointFor(side, mode)}`, {
+  return requestJson(`${scopedBase(apiBase, scope)}${endpointFor(side, mode)}`, {
     method: "POST",
     headers: authHeaders(token),
     body: JSON.stringify(order)
@@ -107,12 +144,12 @@ export async function submitOrder(
 
 export async function replaceOrder(
   apiBase: string,
-  roomId: string | undefined,
+  scope: MarketScope | undefined,
   token: string,
   side: Side,
   order: ReplaceOrderRequest
 ): Promise<SubmitResult> {
-  return requestJson(`${scopedBase(apiBase, roomId)}/orders/replace-${side}`, {
+  return requestJson(`${scopedBase(apiBase, scope)}/orders/replace-${side}`, {
     method: "POST",
     headers: authHeaders(token),
     body: JSON.stringify(order)
@@ -121,47 +158,47 @@ export async function replaceOrder(
 
 export async function cancelOrder(
   apiBase: string,
-  roomId: string | undefined,
+  scope: MarketScope | undefined,
   token: string,
   symbol: string,
   orderId: number
 ): Promise<{ canceled: boolean }> {
-  return requestJson(`${scopedBase(apiBase, roomId)}/orders/cancel`, {
+  return requestJson(`${scopedBase(apiBase, scope)}/orders/cancel`, {
     method: "POST",
     headers: authHeaders(token),
     body: JSON.stringify({ symbol, orderId })
   });
 }
 
-export async function fetchMe(apiBase: string, roomId: string | undefined, token: string): Promise<MeSummary> {
-  return requestJson(`${scopedBase(apiBase, roomId)}/me`, {
+export async function fetchMe(apiBase: string, scope: MarketScope | undefined, token: string): Promise<MeSummary> {
+  return requestJson(`${scopedBase(apiBase, scope)}/me`, {
     headers: authHeaders(token)
   });
 }
 
-export async function fetchOpenOrders(apiBase: string, roomId: string | undefined, token: string): Promise<OpenOrder[]> {
-  const data = await requestJson<{ orders: OpenOrder[] }>(`${scopedBase(apiBase, roomId)}/me/orders`, {
+export async function fetchOpenOrders(apiBase: string, scope: MarketScope | undefined, token: string): Promise<OpenOrder[]> {
+  const data = await requestJson<{ orders: OpenOrder[] }>(`${scopedBase(apiBase, scope)}/me/orders`, {
     headers: authHeaders(token)
   });
   return data.orders;
 }
 
-export async function fetchFills(apiBase: string, roomId: string | undefined, token: string): Promise<FillRecord[]> {
-  const data = await requestJson<{ fills: FillRecord[] }>(`${scopedBase(apiBase, roomId)}/me/fills`, {
+export async function fetchFills(apiBase: string, scope: MarketScope | undefined, token: string): Promise<FillRecord[]> {
+  const data = await requestJson<{ fills: FillRecord[] }>(`${scopedBase(apiBase, scope)}/me/fills`, {
     headers: authHeaders(token)
   });
   return data.fills;
 }
 
-export async function fetchPositions(apiBase: string, roomId: string | undefined, token: string): Promise<PositionRecord[]> {
-  const data = await requestJson<{ positions: PositionRecord[] }>(`${scopedBase(apiBase, roomId)}/me/positions`, {
+export async function fetchPositions(apiBase: string, scope: MarketScope | undefined, token: string): Promise<PositionRecord[]> {
+  const data = await requestJson<{ positions: PositionRecord[] }>(`${scopedBase(apiBase, scope)}/me/positions`, {
     headers: authHeaders(token)
   });
   return data.positions;
 }
 
-export async function fetchPortfolio(apiBase: string, roomId: string | undefined, token: string): Promise<PortfolioRecord> {
-  return requestJson(`${scopedBase(apiBase, roomId)}/me/portfolio`, {
+export async function fetchPortfolio(apiBase: string, scope: MarketScope | undefined, token: string): Promise<PortfolioRecord> {
+  return requestJson(`${scopedBase(apiBase, scope)}/me/portfolio`, {
     headers: authHeaders(token)
   });
 }

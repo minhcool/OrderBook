@@ -2,7 +2,7 @@
 
 The website is a Vite/React app in `web/`. It is a browser UI for the trading game API server.
 
-Users can pick a room, choose an asset, and trade against either a single-player house-liquidity market or a competitive room.
+Users can pick a room, choose an asset, and trade against either a single-player house-liquidity market or a competitive lobby. Competitive rooms expose multiple independent lobbies with different participant capacities.
 
 Authentication is handled by Clerk. Signed-in users can submit, replace, and cancel orders. The website sends a Clerk bearer token to the C++ API server.
 
@@ -86,6 +86,17 @@ GET /rooms/{roomId}/me/fills
 GET /rooms/{roomId}/me/positions
 GET /rooms/{roomId}/me/portfolio
 ```
+
+For competitive mode, the website first lists and joins a lobby:
+
+```text
+GET  /rooms/{roomId}/lobbies
+GET  /lobbies/{lobbyId}/membership
+POST /lobbies/{lobbyId}/join
+POST /lobbies/{lobbyId}/leave
+```
+
+After joining, books, orders, fills, and portfolio requests use `/lobbies/{lobbyId}/...`. The lobby selector displays current participants and capacity. Leaving cancels the user's resting orders in that lobby.
 
 The market strip reads:
 
