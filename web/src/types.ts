@@ -1,5 +1,26 @@
 export type Side = "buy" | "sell";
 export type OrderMode = "limit" | "market" | "ioc" | "fok";
+export type RoomMode = "single" | "competitive";
+
+export interface RoomAsset {
+  symbol: string;
+  displayName: string;
+  behavior: string;
+  source: string;
+  referencePrice: number;
+  signalQuality: string;
+}
+
+export interface GameRoom {
+  id: string;
+  name: string;
+  mode: RoomMode;
+  difficulty: string;
+  startingCash: number;
+  maxParticipants: number;
+  houseLiquidity: boolean;
+  assets: RoomAsset[];
+}
 
 export interface Trade {
   takerId: number;
@@ -97,9 +118,11 @@ export interface PortfolioPositionRecord extends PositionRecord {
 
 export interface PortfolioRecord {
   traderId: number;
+  startingCash: number;
   cashFlow: number;
   marketValue: number;
   estimatedValue: number;
+  tradingPnl: number;
   unrealizedPnl: number;
   positions: PortfolioPositionRecord[];
 }

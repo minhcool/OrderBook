@@ -11,17 +11,30 @@ import {
   fetchOpenOrders,
   fetchPortfolio,
   fetchPrice,
+  fetchRooms,
   fetchSymbols,
   health,
   replaceOrder,
   submitOrder
 } from "./api";
-import type { BookSnapshot, FillRecord, MarketPrice, MeSummary, OpenOrder, OrderMode, PortfolioRecord, Side, SubmitResult } from "./types";
+import type {
+  BookSnapshot,
+  FillRecord,
+  GameRoom,
+  MarketPrice,
+  MeSummary,
+  OpenOrder,
+  OrderMode,
+  PortfolioRecord,
+  Side,
+  SubmitResult
+} from "./types";
 import "./styles.css";
 
 const DEFAULT_API_BASE = import.meta.env.VITE_ORDERBOOK_API_URL ?? "http://localhost:8080";
 const CLERK_PUBLISHABLE_KEY = import.meta.env.VITE_CLERK_PUBLISHABLE_KEY;
-const DEFAULT_SYMBOL = "BTC-USD";
+const DEFAULT_ROOM_ID = "solo-alpha";
+const DEFAULT_SYMBOL = "NOVA";
 
 interface ActivityItem {
   id: number;
@@ -60,6 +73,8 @@ function App() {
   const { user } = useUser();
 
   const [apiBase, setApiBase] = React.useState(() => localStorage.getItem("orderbook.apiBase") ?? DEFAULT_API_BASE);
+  const [roomId, setRoomId] = React.useState(() => localStorage.getItem("orderbook.roomId") ?? DEFAULT_ROOM_ID);
+  const [rooms, setRooms] = React.useState<GameRoom[]>([]);
   const [symbol, setSymbol] = React.useState(DEFAULT_SYMBOL);
   const [symbols, setSymbols] = React.useState<string[]>([]);
   const [book, setBook] = React.useState<BookSnapshot>({ symbol: DEFAULT_SYMBOL, bids: [], asks: [] });
@@ -103,15 +118,19 @@ function App() {
   const refresh = React.useCallback(async () => {
     setLoading(true);
     localStorage.setItem("orderbook.apiBase", apiBase);
+    localStorage.setItem("orderbook.roomId", roomId);
 
     try {
       await health(apiBase);
-      const [nextBook, nextSymbols, nextMarketPrice] = await Promise.all([
-        fetchBook(apiBase, symbol, 10),
-        fetchSymbols(apiBase),
-        fetchPrice(apiBase, symbol)
+      const [nextRooms, nextSymbols] = await Promise.all([fetchRooms(apiBase), fetchSymbols(apiBase, roomId)]);
+      const activeSymbol = nextSymbols.includes(symbol) ? symbol : nextSymbols[0] ?? symbol;
+      const [nextBook, nextMarketPrice] = await Promise.all([
+        fetchBook(apiBase, roomId, activeSymbol, 10),
+        fetchPrice(apiBase, roomId, activeSymbol)
       ]);
 
+      setRooms(nextRooms);
+      setSymbol(activeSymbol);
       setBook(nextBook);
       setSymbols(nextSymbols);
       setMarketPrice(nextMarketPrice);
@@ -122,7 +141,7 @@ function App() {
     } finally {
       setLoading(false);
     }
-  }, [apiBase, pushActivity, symbol]);
+  }, [apiBase, pushActivity, roomId, symbol]);
 
   const refreshAccount = React.useCallback(async () => {
     if (!isLoaded || !isSignedIn) {
@@ -140,10 +159,10 @@ function App() {
       }
 
       const [nextMe, nextOpenOrders, nextFills, nextPortfolio] = await Promise.all([
-        fetchMe(apiBase, token),
-        fetchOpenOrders(apiBase, token),
-        fetchFills(apiBase, token),
-        fetchPortfolio(apiBase, token)
+        fetchMe(apiBase, roomId, token),
+        fetchOpenOrders(apiBase, roomId, token),
+        fetchFills(apiBase, roomId, token),
+        fetchPortfolio(apiBase, roomId, token)
       ]);
 
       setMe(nextMe);
@@ -153,7 +172,7 @@ function App() {
     } catch (error) {
       pushActivity("Account refresh failed", error instanceof Error ? error.message : "Request failed", false);
     }
-  }, [apiBase, getToken, isLoaded, isSignedIn, pushActivity]);
+  }, [apiBase, getToken, isLoaded, isSignedIn, pushActivity, roomId]);
 
   const refreshAll = React.useCallback(async () => {
     await Promise.all([refresh(), refreshAccount()]);
@@ -178,7 +197,7 @@ function App() {
 
     try {
       const token = await requireToken();
-      const result = await submitOrder(apiBase, token, side, mode, payload);
+      const result = await submitOrder(apiBase, roomId, token, side, mode, payload);
       pushActivity(`${mode.toUpperCase()} ${side.toUpperCase()} #${result.orderId}`, resultSummary(result), result.accepted);
       if (result.accepted && result.restingQuantity > 0) {
         setReplaceSide(side);
@@ -203,7 +222,7 @@ function App() {
 
     try {
       const token = await requireToken();
-      const result = await replaceOrder(apiBase, token, replaceSide, payload);
+      const result = await replaceOrder(apiBase, roomId, token, replaceSide, payload);
       pushActivity(`REPLACE ${replaceSide.toUpperCase()} #${payload.orderId}`, resultSummary(result), result.accepted);
       await refreshAll();
     } catch (error) {
@@ -216,7 +235,7 @@ function App() {
 
     try {
       const token = await requireToken();
-      const result = await cancelOrder(apiBase, token, symbol, toNumber(cancelId));
+      const result = await cancelOrder(apiBase, roomId, token, symbol, toNumber(cancelId));
       pushActivity(`CANCEL #${cancelId}`, result.canceled ? "canceled" : "order not found", result.canceled);
       await refreshAll();
     } catch (error) {
@@ -226,13 +245,15 @@ function App() {
 
   const spread = book.bids.length > 0 && book.asks.length > 0 ? book.asks[0].price - book.bids[0].price : null;
   const signedInName = user?.primaryEmailAddress?.emailAddress ?? user?.fullName ?? user?.id ?? "Signed in";
+  const selectedRoom = rooms.find((room) => room.id === roomId);
+  const selectedAsset = selectedRoom?.assets.find((asset) => asset.symbol === symbol);
 
   return (
     <main className="shell">
       <header className="topbar">
         <div>
-          <h1>Orderbook Console</h1>
-          <p>{symbol}</p>
+          <h1>Trading Game Console</h1>
+          <p>{selectedRoom ? `${selectedRoom.name} / ${symbol}` : symbol}</p>
         </div>
         <div className="status-row">
           <Show when="signed-in">
@@ -263,6 +284,20 @@ function App() {
           <input value={apiBase} onChange={(event) => setApiBase(event.target.value)} />
         </label>
         <label>
+          Room
+          <select value={roomId} onChange={(event) => setRoomId(event.target.value)}>
+            {rooms.length === 0 ? (
+              <option value={roomId}>{roomId}</option>
+            ) : (
+              rooms.map((room) => (
+                <option key={room.id} value={room.id}>
+                  {room.name}
+                </option>
+              ))
+            )}
+          </select>
+        </label>
+        <label>
           Symbol
           <input value={symbol} onChange={(event) => setSymbol(event.target.value.toUpperCase())} />
         </label>
@@ -276,6 +311,12 @@ function App() {
               {item}
             </button>
           ))}
+        </div>
+        <div className="room-meta">
+          <span>{selectedRoom?.mode ?? "single"}</span>
+          <span>{selectedRoom?.difficulty ?? "dev"}</span>
+          <span>{selectedAsset?.behavior ?? "manual"}</span>
+          <span>{selectedAsset?.source ?? "sandbox"}</span>
         </div>
       </section>
 

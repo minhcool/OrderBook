@@ -1,6 +1,8 @@
 # Website
 
-The website is a Vite/React app in `web/`. It is a browser UI for the local HTTP API server.
+The website is a Vite/React app in `web/`. It is a browser UI for the trading game API server.
+
+Users can pick a room, choose an asset, and trade against either a single-player house-liquidity market or a competitive room.
 
 Authentication is handled by Clerk. Signed-in users can submit, replace, and cancel orders. The website sends a Clerk bearer token to the C++ API server.
 
@@ -75,25 +77,25 @@ The C++ API server now includes basic CORS headers for browser requests.
 
 ## Account Data
 
-The account panel reads these authenticated endpoints:
+The account panel reads these authenticated room endpoints:
 
 ```text
-GET /me
-GET /me/orders
-GET /me/fills
-GET /me/positions
-GET /me/portfolio
+GET /rooms/{roomId}/me
+GET /rooms/{roomId}/me/orders
+GET /rooms/{roomId}/me/fills
+GET /rooms/{roomId}/me/positions
+GET /rooms/{roomId}/me/portfolio
 ```
 
 The market strip reads:
 
 ```text
-GET /prices/{symbol}
+GET /rooms/{roomId}/prices/{symbol}
 ```
 
 This data is currently in memory on the C++ API server. It is enough to test a real user flow, but it is not durable yet: restarting or redeploying the API clears the books, trade tape, fills, derived positions, and portfolio marks.
 
-Portfolio value is estimated from trade cash flow and last-trade marks. It is not a real account balance yet because deposits, withdrawals, reserves, and starting balances are not implemented.
+Portfolio value is estimated from room starting cash, trade cash flow, and last-trade marks. It is not a real account balance yet because deposits, withdrawals, and reserves are not implemented.
 
 ## Clerk Setup
 

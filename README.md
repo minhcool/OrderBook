@@ -1,6 +1,6 @@
 # Orderbook
 
-A small C++20 limit order book / matching-engine project.
+A C++20 limit order book and trading-game simulator.
 
 The project currently provides an in-memory orderbook library with:
 
@@ -15,11 +15,24 @@ The project currently provides an in-memory orderbook library with:
 - server-assigned HTTP order IDs
 - authenticated open-order, fill-history, and derived-position endpoints
 - public trade tape, last-trade marks, and simple portfolio valuation
+- single-player and competitive game rooms
+- fictional room assets, including synthetic and masked-real-series profiles
+- room-scoped order books and portfolios
 - coarse-grained mutex protection
 - correctness tests
 - performance benchmarks
 
 It is not connected to a real exchange or database yet. The current API and website are development prototypes; all orderbook state is in memory and disappears when the API process restarts.
+
+The game direction is:
+
+```text
+Trading engine
+  -> rooms
+  -> fictional assets
+  -> human users, bots, and simulated liquidity
+  -> portfolio valuation and leaderboard-ready scoring
+```
 
 ## Layout
 
@@ -130,6 +143,8 @@ For deploying the C++ API server, see [docs/DEPLOY_API.md](docs/DEPLOY_API.md).
 - Backend JWT signature verification is not implemented yet; the current API auth bridge is for development.
 - No durable balances, deposits, withdrawals, margin, or settlement.
 - Portfolio values are estimates from trade cash flow and in-memory last-trade marks.
+- No leaderboard, room clock, news engine, or bot tournament scheduler yet.
+- Masked-real-series assets are only metadata placeholders until a licensed historical data import exists.
 - No persistence or event log.
 - No tick size or lot size validation.
 - Cancel and replace still scan the book instead of using an order ID index.

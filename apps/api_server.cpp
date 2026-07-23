@@ -9,6 +9,7 @@
 #include <iomanip>
 #include <iostream>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <regex>
@@ -131,9 +132,11 @@ struct PortfolioPositionRecord {
 
 struct PortfolioRecord {
     TraderId traderId = 0;
+    std::int64_t startingCash = 0;
     std::int64_t cashFlow = 0;
     double marketValue = 0.0;
     double estimatedValue = 0.0;
+    double tradingPnl = 0.0;
     double unrealizedPnl = 0.0;
     std::vector<PortfolioPositionRecord> positions;
 };
@@ -226,11 +229,12 @@ public:
         return positionsForTraderLocked(traderId);
     }
 
-    PortfolioRecord portfolioForTrader(TraderId traderId) const {
+    PortfolioRecord portfolioForTrader(TraderId traderId, std::int64_t startingCash = 0) const {
         std::lock_guard<std::mutex> lock(accountMutex);
 
         PortfolioRecord portfolio;
         portfolio.traderId = traderId;
+        portfolio.startingCash = startingCash;
         const std::vector<PositionRecord> positions = positionsForTraderLocked(traderId);
         portfolio.positions.reserve(positions.size());
 
@@ -255,7 +259,8 @@ public:
             portfolio.positions.push_back(marked);
         }
 
-        portfolio.estimatedValue = static_cast<double>(portfolio.cashFlow) + portfolio.marketValue;
+        portfolio.tradingPnl = static_cast<double>(portfolio.cashFlow) + portfolio.marketValue;
+        portfolio.estimatedValue = static_cast<double>(portfolio.startingCash) + portfolio.tradingPnl;
         return portfolio;
     }
 
@@ -440,6 +445,54 @@ private:
     std::vector<MarketTradeRecord> marketTrades;
 };
 
+enum class RoomMode {
+    Single,
+    Competitive,
+};
+
+struct AssetConfig {
+    std::string symbol;
+    std::string displayName;
+    std::string behavior;
+    std::string source;
+    Price referencePrice = 0;
+    std::string signalQuality;
+};
+
+struct GameRoom {
+    std::string id;
+    std::string name;
+    RoomMode mode = RoomMode::Single;
+    std::string difficulty;
+    std::int64_t startingCash = 100000;
+    int maxParticipants = 1;
+    bool houseLiquidity = true;
+    Exchange exchange;
+    AccountStore accounts;
+    OrderIdGenerator orderIds;
+    std::vector<AssetConfig> assets;
+};
+
+struct ParsedRoomPath {
+    std::string roomId;
+    std::string nestedPath;
+};
+
+class RoomStore {
+public:
+    RoomStore();
+
+    GameRoom* find(const std::string& roomId);
+    GameRoom& defaultRoom();
+    std::vector<const GameRoom*> rooms() const;
+
+private:
+    void addRoom(std::unique_ptr<GameRoom> room);
+
+    std::map<std::string, std::unique_ptr<GameRoom>> roomById;
+    std::string defaultRoomId = "sandbox";
+};
+
 #ifdef _WIN32
 class SocketRuntime {
 public:
@@ -564,6 +617,10 @@ std::string sideToString(Side side) {
     return side == Side::Buy ? "buy" : "sell";
 }
 
+std::string roomModeToString(RoomMode mode) {
+    return mode == RoomMode::Single ? "single" : "competitive";
+}
+
 std::string jsonError(const std::string& message) {
     return "{\"error\":\"" + jsonEscape(message) + "\"}";
 }
@@ -652,6 +709,66 @@ std::string serializeSymbols(const std::vector<std::string>& symbols) {
         }
 
         out << "\"" << jsonEscape(symbols[i]) << "\"";
+    }
+
+    out << "]}";
+    return out.str();
+}
+
+std::string serializeAsset(const AssetConfig& asset) {
+    std::ostringstream out;
+    out << "{"
+        << "\"symbol\":\"" << jsonEscape(asset.symbol) << "\","
+        << "\"displayName\":\"" << jsonEscape(asset.displayName) << "\","
+        << "\"behavior\":\"" << jsonEscape(asset.behavior) << "\","
+        << "\"source\":\"" << jsonEscape(asset.source) << "\","
+        << "\"referencePrice\":" << asset.referencePrice << ","
+        << "\"signalQuality\":\"" << jsonEscape(asset.signalQuality) << "\""
+        << "}";
+    return out.str();
+}
+
+std::string serializeAssets(const std::vector<AssetConfig>& assets) {
+    std::ostringstream out;
+    out << "[";
+
+    for (std::size_t i = 0; i < assets.size(); ++i) {
+        if (i > 0) {
+            out << ",";
+        }
+
+        out << serializeAsset(assets[i]);
+    }
+
+    out << "]";
+    return out.str();
+}
+
+std::string serializeRoom(const GameRoom& room) {
+    std::ostringstream out;
+    out << "{"
+        << "\"id\":\"" << jsonEscape(room.id) << "\","
+        << "\"name\":\"" << jsonEscape(room.name) << "\","
+        << "\"mode\":\"" << roomModeToString(room.mode) << "\","
+        << "\"difficulty\":\"" << jsonEscape(room.difficulty) << "\","
+        << "\"startingCash\":" << room.startingCash << ","
+        << "\"maxParticipants\":" << room.maxParticipants << ","
+        << "\"houseLiquidity\":" << (room.houseLiquidity ? "true" : "false") << ","
+        << "\"assets\":" << serializeAssets(room.assets)
+        << "}";
+    return out.str();
+}
+
+std::string serializeRooms(const std::vector<const GameRoom*>& rooms) {
+    std::ostringstream out;
+    out << "{\"rooms\":[";
+
+    for (std::size_t i = 0; i < rooms.size(); ++i) {
+        if (i > 0) {
+            out << ",";
+        }
+
+        out << serializeRoom(*rooms[i]);
     }
 
     out << "]}";
@@ -835,9 +952,11 @@ std::string serializePortfolio(const PortfolioRecord& portfolio) {
     std::ostringstream out;
     out << "{"
         << "\"traderId\":" << portfolio.traderId << ","
+        << "\"startingCash\":" << portfolio.startingCash << ","
         << "\"cashFlow\":" << portfolio.cashFlow << ","
         << "\"marketValue\":" << jsonDouble(portfolio.marketValue) << ","
         << "\"estimatedValue\":" << jsonDouble(portfolio.estimatedValue) << ","
+        << "\"tradingPnl\":" << jsonDouble(portfolio.tradingPnl) << ","
         << "\"unrealizedPnl\":" << jsonDouble(portfolio.unrealizedPnl) << ","
         << "\"positions\":[";
 
@@ -1135,6 +1254,21 @@ std::optional<std::string> symbolFromPrefixedPath(const std::string& path, const
     return urlDecode(path.substr(prefix.size()));
 }
 
+std::optional<ParsedRoomPath> parseRoomPath(const std::string& path) {
+    const std::string prefix = "/rooms/";
+    if (path.rfind(prefix, 0) != 0 || path.size() <= prefix.size()) {
+        return std::nullopt;
+    }
+
+    const std::size_t roomStart = prefix.size();
+    const std::size_t slash = path.find('/', roomStart);
+    if (slash == std::string::npos) {
+        return ParsedRoomPath{urlDecode(path.substr(roomStart)), ""};
+    }
+
+    return ParsedRoomPath{urlDecode(path.substr(roomStart, slash - roomStart)), path.substr(slash)};
+}
+
 HttpResponse jsonResponse(int status, const std::string& body) {
     return {status, "application/json", body};
 }
@@ -1144,7 +1278,12 @@ HttpResponse orderResultResponse(AccountStore& accounts, const std::string& symb
     return jsonResponse(200, serializeSubmitResult(result));
 }
 
-HttpResponse handleGetMe(Exchange& exchange, AccountStore& accounts, const std::string& path, const HttpRequest& request) {
+HttpResponse handleGetMe(
+    Exchange& exchange,
+    AccountStore& accounts,
+    std::int64_t startingCash,
+    const std::string& path,
+    const HttpRequest& request) {
     try {
         const TraderId traderId = authenticatedTraderId(request);
 
@@ -1168,7 +1307,7 @@ HttpResponse handleGetMe(Exchange& exchange, AccountStore& accounts, const std::
         }
 
         if (path == "/me/portfolio") {
-            return jsonResponse(200, serializePortfolio(accounts.portfolioForTrader(traderId)));
+            return jsonResponse(200, serializePortfolio(accounts.portfolioForTrader(traderId, startingCash)));
         }
     } catch (const AuthError& ex) {
         return jsonResponse(401, jsonError(ex.what()));
@@ -1277,8 +1416,11 @@ HttpResponse handlePostOrder(
     return jsonResponse(404, jsonError("unknown POST endpoint"));
 }
 
-HttpResponse route(Exchange& exchange, AccountStore& accounts, OrderIdGenerator& orderIds, const HttpRequest& request) {
+HttpResponse routeRoom(GameRoom& room, const HttpRequest& request) {
     const auto [path, query] = splitQuery(request.path);
+    Exchange& exchange = room.exchange;
+    AccountStore& accounts = room.accounts;
+    OrderIdGenerator& orderIds = room.orderIds;
 
     if (request.method == "OPTIONS") {
         return jsonResponse(200, "{}");
@@ -1314,7 +1456,7 @@ HttpResponse route(Exchange& exchange, AccountStore& accounts, OrderIdGenerator&
 
         if (path == "/me" || path == "/me/orders" || path == "/me/fills" || path == "/me/trades"
             || path == "/me/positions" || path == "/me/portfolio") {
-            return handleGetMe(exchange, accounts, path, request);
+            return handleGetMe(exchange, accounts, room.startingCash, path, request);
         }
 
         return jsonResponse(404, jsonError("unknown GET endpoint"));
@@ -1325,6 +1467,46 @@ HttpResponse route(Exchange& exchange, AccountStore& accounts, OrderIdGenerator&
     }
 
     return jsonResponse(405, jsonError("only GET, POST, and OPTIONS are supported"));
+}
+
+HttpResponse route(RoomStore& rooms, const HttpRequest& request) {
+    const auto [path, query] = splitQuery(request.path);
+
+    if (request.method == "OPTIONS") {
+        return jsonResponse(200, "{}");
+    }
+
+    if (request.method == "GET") {
+        if (path == "/health") {
+            return jsonResponse(200, "{\"ok\":true}");
+        }
+
+        if (path == "/rooms") {
+            return jsonResponse(200, serializeRooms(rooms.rooms()));
+        }
+    }
+
+    const std::optional<ParsedRoomPath> roomPath = parseRoomPath(path);
+    if (roomPath) {
+        GameRoom* room = rooms.find(roomPath->roomId);
+        if (room == nullptr) {
+            return jsonResponse(404, jsonError("unknown room"));
+        }
+
+        if (roomPath->nestedPath.empty()) {
+            if (request.method == "GET") {
+                return jsonResponse(200, serializeRoom(*room));
+            }
+
+            return jsonResponse(405, jsonError("room detail only supports GET"));
+        }
+
+        HttpRequest scopedRequest = request;
+        scopedRequest.path = roomPath->nestedPath + (query.empty() ? "" : "?" + query);
+        return routeRoom(*room, scopedRequest);
+    }
+
+    return routeRoom(rooms.defaultRoom(), request);
 }
 
 std::optional<HttpRequest> parseRequest(const std::string& raw, std::size_t headerEnd) {
@@ -1443,9 +1625,132 @@ SocketHandle createServerSocket(int port) {
     return server;
 }
 
+constexpr TraderId HouseTraderId = 9'000'000'001LL;
+
 void seedDefaultBooks(Exchange& exchange) {
     exchange.ensureBook("BTC-USD");
     exchange.ensureBook("ETH-USD");
+}
+
+void seedHouseLiquidity(GameRoom& room, const AssetConfig& asset, int levels, Qty baseQuantity) {
+    room.exchange.ensureBook(asset.symbol);
+
+    if (!room.houseLiquidity || asset.referencePrice <= 2) {
+        return;
+    }
+
+    const Price baseSpread = std::max<Price>(1, asset.referencePrice / 100);
+    for (int level = 0; level < levels; ++level) {
+        const Price offset = baseSpread + level;
+        const Qty quantity = baseQuantity + static_cast<Qty>(level * baseQuantity / 2);
+        const Price bid = std::max<Price>(1, asset.referencePrice - offset);
+        const Price ask = asset.referencePrice + offset;
+
+        room.exchange.buy(asset.symbol, HouseTraderId, room.orderIds.next(), bid, quantity);
+        room.exchange.sell(asset.symbol, HouseTraderId, room.orderIds.next(), ask, quantity);
+    }
+}
+
+void seedRoom(GameRoom& room) {
+    for (const AssetConfig& asset : room.assets) {
+        seedHouseLiquidity(room, asset, room.mode == RoomMode::Single ? 5 : 3, room.mode == RoomMode::Single ? 60 : 25);
+    }
+}
+
+std::unique_ptr<GameRoom> makeSandboxRoom() {
+    auto room = std::make_unique<GameRoom>();
+    room->id = "sandbox";
+    room->name = "Sandbox";
+    room->mode = RoomMode::Single;
+    room->difficulty = "dev";
+    room->startingCash = 100000;
+    room->maxParticipants = 1;
+    room->houseLiquidity = false;
+    room->assets = {
+        {"BTC-USD", "Sandbox BTC", "manual-testing", "sandbox", 100, "none"},
+        {"ETH-USD", "Sandbox ETH", "manual-testing", "sandbox", 50, "none"},
+    };
+    seedDefaultBooks(room->exchange);
+    return room;
+}
+
+std::unique_ptr<GameRoom> makeSinglePlayerRoom() {
+    auto room = std::make_unique<GameRoom>();
+    room->id = "solo-alpha";
+    room->name = "Solo Alpha Lab";
+    room->mode = RoomMode::Single;
+    room->difficulty = "medium";
+    room->startingCash = 100000;
+    room->maxParticipants = 1;
+    room->houseLiquidity = true;
+    room->assets = {
+        {"NOVA", "Nova Systems", "trend-cycle", "synthetic", 100, "learnable"},
+        {"ORBIT", "Orbit Retail", "factor-noisy", "masked-real-series", 64, "moderate"},
+        {"LYRA", "Lyra Materials", "mean-reverting", "synthetic", 42, "learnable"},
+        {"MIST", "Mist Biotech", "noise-trap", "synthetic", 28, "low"},
+    };
+    seedRoom(*room);
+    return room;
+}
+
+std::unique_ptr<GameRoom> makeCompetitiveRoom() {
+    auto room = std::make_unique<GameRoom>();
+    room->id = "comp-aurora";
+    room->name = "Aurora Competitive";
+    room->mode = RoomMode::Competitive;
+    room->difficulty = "hard";
+    room->startingCash = 100000;
+    room->maxParticipants = 20;
+    room->houseLiquidity = true;
+    room->assets = {
+        {"AXON", "Axon Energy", "event-driven", "masked-real-series", 88, "moderate"},
+        {"CROWN", "Crown Foods", "seasonal-demand", "synthetic", 73, "learnable"},
+        {"QUILL", "Quill Cloud", "regime-shift", "masked-real-series", 120, "hard"},
+        {"STATIC", "Static Holdings", "noise-trap", "synthetic", 55, "low"},
+    };
+    seedRoom(*room);
+    return room;
+}
+
+RoomStore::RoomStore() {
+    addRoom(makeSandboxRoom());
+    addRoom(makeSinglePlayerRoom());
+    addRoom(makeCompetitiveRoom());
+}
+
+void RoomStore::addRoom(std::unique_ptr<GameRoom> room) {
+    const std::string id = room->id;
+    roomById[id] = std::move(room);
+}
+
+GameRoom* RoomStore::find(const std::string& roomId) {
+    const auto it = roomById.find(roomId);
+    if (it == roomById.end()) {
+        return nullptr;
+    }
+
+    return it->second.get();
+}
+
+GameRoom& RoomStore::defaultRoom() {
+    GameRoom* room = find(defaultRoomId);
+    if (room == nullptr) {
+        throw std::runtime_error("default room missing");
+    }
+
+    return *room;
+}
+
+std::vector<const GameRoom*> RoomStore::rooms() const {
+    std::vector<const GameRoom*> result;
+    result.reserve(roomById.size());
+
+    for (const auto& [id, room] : roomById) {
+        (void)id;
+        result.push_back(room.get());
+    }
+
+    return result;
 }
 
 int parsePort(const char* value, int fallback) {
@@ -1473,10 +1778,7 @@ int main(int argc, char** argv) {
     try {
         SocketRuntime runtime;
         SocketHandle server = createServerSocket(port);
-        Exchange exchange;
-        AccountStore accounts;
-        OrderIdGenerator orderIds;
-        seedDefaultBooks(exchange);
+        RoomStore rooms;
 
         std::cout << "Orderbook API server listening on 0.0.0.0:" << port << "\n";
         std::cout << "Press Ctrl+C to stop.\n";
@@ -1491,7 +1793,7 @@ int main(int argc, char** argv) {
 
             std::optional<HttpRequest> request = readRequest(client);
             if (request) {
-                sendResponse(client, route(exchange, accounts, orderIds, *request));
+                sendResponse(client, route(rooms, *request));
             } else {
                 sendResponse(client, jsonResponse(400, jsonError("could not parse request")));
             }

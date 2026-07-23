@@ -18,7 +18,8 @@ body {
 }
 
 button,
-input {
+input,
+select {
   font: inherit;
 }
 
@@ -47,7 +48,8 @@ input:disabled {
   opacity: 0.55;
 }
 
-input {
+input,
+select {
   border: 1px solid #c8d0dc;
   border-radius: 7px;
   color: #172033;
@@ -57,7 +59,8 @@ input {
   width: 100%;
 }
 
-input:focus {
+input:focus,
+select:focus {
   border-color: #2f6fed;
   box-shadow: 0 0 0 3px rgba(47, 111, 237, 0.12);
 }
@@ -161,7 +164,7 @@ input:focus {
   align-items: end;
   display: grid;
   gap: 12px;
-  grid-template-columns: minmax(220px, 1.5fr) minmax(140px, 0.7fr) auto minmax(180px, 1fr);
+  grid-template-columns: minmax(220px, 1.4fr) minmax(170px, 0.8fr) minmax(140px, 0.7fr) auto minmax(180px, 1fr);
   padding: 14px;
 }
 
@@ -179,6 +182,24 @@ label {
   display: flex;
   flex-wrap: wrap;
   gap: 8px;
+}
+
+.room-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  grid-column: 1 / -1;
+}
+
+.room-meta span {
+  background: #f7f9fb;
+  border: 1px solid #edf1f5;
+  border-radius: 999px;
+  color: #526176;
+  font-size: 12px;
+  font-weight: 750;
+  padding: 6px 9px;
+  text-transform: uppercase;
 }
 
 .symbols button {

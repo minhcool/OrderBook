@@ -28,7 +28,8 @@ Stop it with `Ctrl+C`.
 - The server stores all state in memory.
 - Restarting the server clears all books.
 - One symbol maps to one orderbook.
-- The API server starts with empty `BTC-USD` and `ETH-USD` books.
+- The API server starts with a backward-compatible `sandbox` room and game rooms for single-player and competitive trading.
+- Old routes like `/book/BTC-USD` use the `sandbox` room. Game routes use `/rooms/{roomId}/...`.
 - New order IDs are assigned by the server. Clients pass `orderId` only when replacing or canceling an existing order.
 - Open orders, fills, and positions are also stored/read in memory.
 - Price marks are based on the public trade tape. The current portfolio mark uses the last trade price; `/prices` also exposes VWAPs over the last 3, 5, and 10 trades.
@@ -52,10 +53,48 @@ Response:
 { "ok": true }
 ```
 
+Rooms:
+
+```http
+GET /rooms
+GET /rooms/{roomId}
+```
+
+Response:
+
+```json
+{
+  "rooms": [
+    {
+      "id": "solo-alpha",
+      "name": "Solo Alpha Lab",
+      "mode": "single",
+      "difficulty": "medium",
+      "startingCash": 100000,
+      "maxParticipants": 1,
+      "houseLiquidity": true,
+      "assets": [
+        {
+          "symbol": "NOVA",
+          "displayName": "Nova Systems",
+          "behavior": "trend-cycle",
+          "source": "synthetic",
+          "referencePrice": 100,
+          "signalQuality": "learnable"
+        }
+      ]
+    }
+  ]
+}
+```
+
+The asset `source` may say `masked-real-series`, but the API does not reveal the real-world backing symbol.
+
 Known symbols:
 
 ```http
 GET /symbols
+GET /rooms/{roomId}/symbols
 ```
 
 Response:
@@ -69,6 +108,8 @@ Market prices:
 ```http
 GET /prices
 GET /prices/{symbol}
+GET /rooms/{roomId}/prices
+GET /rooms/{roomId}/prices/{symbol}
 ```
 
 Response:
@@ -94,6 +135,7 @@ Recent market trades:
 ```http
 GET /trades/{symbol}
 GET /trades/{symbol}?limit=50
+GET /rooms/{roomId}/trades/{symbol}?limit=50
 ```
 
 Response:
@@ -122,6 +164,7 @@ Book snapshot:
 ```http
 GET /book/{symbol}
 GET /book/{symbol}?depth=5
+GET /rooms/{roomId}/book/{symbol}
 ```
 
 Response:
@@ -241,10 +284,16 @@ GET /me/portfolio
 Authorization: Bearer <Clerk session token>
 ```
 
-`cashFlow` is quote currency received/spent from fills only. Because deposits and starting balances do not exist yet, `estimatedValue` is the trading-derived estimate:
+`cashFlow` is quote currency received/spent from fills only. `tradingPnl` is the trading-derived estimate:
 
 ```text
 cashFlow + sum(position quantity * last trade price)
+```
+
+`estimatedValue` adds the room's starting cash:
+
+```text
+startingCash + tradingPnl
 ```
 
 Response:
@@ -252,9 +301,11 @@ Response:
 ```json
 {
   "traderId": 194214855,
+  "startingCash": 100000,
   "cashFlow": -607,
   "marketValue": 630,
-  "estimatedValue": 23,
+  "estimatedValue": 100023,
+  "tradingPnl": 23,
   "unrealizedPnl": 23,
   "positions": [
     {
@@ -275,6 +326,12 @@ Response:
 ```
 
 ## POST Endpoints
+
+Every order endpoint also works inside a game room:
+
+```text
+/rooms/{roomId}/orders/...
+```
 
 Regular limit orders:
 
