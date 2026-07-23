@@ -6,11 +6,11 @@ Users can pick a room/lobby, enter that session, choose an asset, and trade agai
 
 Authentication is handled by Clerk. Signed-in users can enter exactly one active session, then submit, replace, and cancel orders. Leaving cancels resting orders and starts a short cooldown before re-entering.
 
-Live updates are enabled by default. The website polls the API while the user is inside a session; in single-player mode, each live poll also advances the user's personal simulator by one tick.
+Live updates are enabled by default. The website polls the API while the user is inside a session; in single-player mode, each live poll also advances the user's personal simulator by one tick. The session panel shows room choice, lobby capacity, phase/timer state, the active session lock, and the manual/bot track selector for competitive lobbies.
 
 New order IDs are assigned by the API server. The website shows returned IDs in activity and uses them for replace/cancel actions.
 
-Signed-in users can also see their account panel after entering a session: current open orders, recent fills/trades, positions derived from those fills, cash, reserved cash, available cash, marked market value, estimated value, and unrealized PnL.
+Signed-in users can also see their account panel after entering a session: current open orders, recent fills/trades, public trade tape, positions derived from fills, cash, reserved cash, available cash, marked market value, estimated value, trading PnL, and unrealized PnL.
 
 ## Local Run
 

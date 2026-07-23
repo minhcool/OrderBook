@@ -86,6 +86,26 @@ Invoke-RestMethod -Method Post -Uri "$api/lobbies/aurora-open-10/orders/buy" `
   -Headers $headers -ContentType "application/json" -Body $order
 ```
 
+## Runnable Example Bot
+
+The repo includes a tiny standard-library Python bot:
+
+```powershell
+python examples/simple_bot.py --api http://localhost:8080 --mode single --iterations 10
+```
+
+For deployed testing:
+
+```powershell
+$env:ORDERBOOK_API_URL = "https://your-orderbook-api.onrender.com"
+$env:ORDERBOOK_BOT_TOKEN = "<Clerk session token>"
+python examples/simple_bot.py --mode single --iterations 10
+```
+
+By default, the script joins `solo-alpha`, advances the simulator, reads the book and portfolio, then alternates small IOC buys/sells. Use `--mode competitive --lobby aurora-open-10` to join a competitive lobby on the bot track.
+
+For local prototype testing without Clerk, omit `ORDERBOOK_BOT_TOKEN`; the script creates a development token with a `sub` claim. Do not rely on that once real JWT verification is enabled.
+
 ## Current Limits
 
 - No WebSocket stream yet; bots should poll.

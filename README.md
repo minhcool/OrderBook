@@ -17,6 +17,7 @@ The project currently provides an in-memory orderbook library with:
 - room/lobby trade tape, last-trade marks, and simple portfolio valuation
 - single-player and competitive game rooms
 - single-player simulated market ticks with dynamic house liquidity
+- website session panel with lobby capacity, timers, track choice, account state, and recent trades
 - multiple competitive lobbies with independent books and enforced capacities
 - authenticated room/lobby enter and exit
 - one active session per user
@@ -25,6 +26,7 @@ The project currently provides an in-memory orderbook library with:
 - starting cash, available cash, reserved cash, and no-short/no-overspend checks
 - manual and bot tracks with chess-style Elo updates at game end
 - bot-facing HTTP workflow using the same room/lobby APIs
+- a small standard-library Python example bot
 - optional PostgreSQL event/history persistence through `DATABASE_URL`
 - startup restore from a replayable PostgreSQL event log
 - checkpoint watermark records for future snapshot fast-forwarding
@@ -108,6 +110,12 @@ Run the competitive lobby API integration test:
 
 ```powershell
 mingw32-make api-test
+```
+
+Run the example single-player bot against a local API server:
+
+```powershell
+python examples/simple_bot.py --api http://localhost:8080 --mode single --iterations 10
 ```
 
 Remove generated build files:

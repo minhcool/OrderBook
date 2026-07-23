@@ -24,6 +24,7 @@ import {
   fetchLeaderboard,
   fetchLobbies,
   fetchLobbyMembership,
+  fetchMarketTrades,
   fetchMe,
   fetchOpenOrders,
   fetchPortfolio,
@@ -40,6 +41,7 @@ import {
   submitOrder
 } from "./api";
 import type {
+  ActiveSession,
   BookSnapshot,
   FillRecord,
   GameLobby,
@@ -48,9 +50,11 @@ import type {
   LobbyMembership,
   MarketScope,
   MarketPrice,
+  MarketTradeRecord,
   MeSummary,
   OpenOrder,
   OrderMode,
+  ParticipantTrack,
   PortfolioRecord,
   Side,
   SubmitResult
@@ -117,6 +121,7 @@ function App() {
   const [fills, setFills] = React.useState<FillRecord[]>([]);
   const [portfolio, setPortfolio] = React.useState<PortfolioRecord | null>(null);
   const [leaderboard, setLeaderboard] = React.useState<LeaderboardRow[]>([]);
+  const [marketTrades, setMarketTrades] = React.useState<MarketTradeRecord[]>([]);
   const [liveUpdates, setLiveUpdates] = React.useState(() => localStorage.getItem("orderbook.liveUpdates") !== "false");
   const liveRefreshInFlight = React.useRef(false);
 
@@ -130,6 +135,7 @@ function App() {
   const [replacePriceValue, setReplacePriceValue] = React.useState("101");
   const [replaceQuantity, setReplaceQuantity] = React.useState("5");
   const [cancelId, setCancelId] = React.useState("1001");
+  const [joinTrack, setJoinTrack] = React.useState<ParticipantTrack>("manual");
 
   const selectedRoom = rooms.find((room) => room.id === roomId);
   const isCompetitive = selectedRoom?.mode === "competitive";
@@ -144,7 +150,15 @@ function App() {
   const gameIsRunning = !isCompetitive || selectedLobby?.phase === "running";
   const canTrade = canViewMarket && gameIsRunning;
   const cooldownRemaining = membership?.cooldownRemainingSeconds ?? 0;
+  const activeSession = membership?.activeSession ?? null;
+  const activeSessionMatches = Boolean(activeSession && (
+    isCompetitive
+      ? activeSession.competitive && activeSession.id === lobbyId
+      : !activeSession.competitive && activeSession.roomId === roomId
+  ));
+  const activeElsewhere = Boolean(activeSession && !activeSessionMatches);
   const entryDisabled = cooldownRemaining > 0
+    || activeElsewhere
     || (isCompetitive && selectedLobby?.status !== "open");
 
   const pushActivity = React.useCallback((title: string, detail: string, ok: boolean) => {
@@ -214,19 +228,22 @@ function App() {
       if (nextMembership?.joined) {
         const nextSymbols = await fetchSymbols(apiBase, scope);
         const activeSymbol = nextSymbols.includes(symbol) ? symbol : nextSymbols[0] ?? symbol;
-        const [nextBook, nextMarketPrice] = await Promise.all([
+        const [nextBook, nextMarketPrice, nextMarketTrades] = await Promise.all([
           fetchBook(apiBase, scope, activeSymbol, 10),
-          fetchPrice(apiBase, scope, activeSymbol)
+          fetchPrice(apiBase, scope, activeSymbol),
+          fetchMarketTrades(apiBase, scope, activeSymbol, 20)
         ]);
 
         setSymbol(activeSymbol);
         setBook(nextBook);
         setSymbols(nextSymbols);
         setMarketPrice(nextMarketPrice);
+        setMarketTrades(nextMarketTrades);
       } else {
         setBook({ symbol, bids: [], asks: [] });
         setSymbols([]);
         setMarketPrice(null);
+        setMarketTrades([]);
         setMe(null);
         setOpenOrders([]);
         setFills([]);
@@ -251,6 +268,7 @@ function App() {
       setFills([]);
       setPortfolio(null);
       setLeaderboard([]);
+      setMarketTrades([]);
       return;
     }
 
@@ -278,6 +296,7 @@ function App() {
         setFills([]);
         setPortfolio(null);
         setLeaderboard([]);
+        setMarketTrades([]);
         return;
       }
 
@@ -420,11 +439,12 @@ function App() {
     try {
       const token = await requireToken();
       const result = isCompetitive
-        ? await joinLobby(apiBase, lobbyId, token)
+        ? await joinLobby(apiBase, lobbyId, token, joinTrack)
         : await joinRoom(apiBase, roomId, token);
       setMembership({
         joined: result.joined,
         traderId: result.traderId,
+        track: isCompetitive ? joinTrack : undefined,
         cooldownRemainingSeconds: result.cooldownRemainingSeconds,
         activeSession: result.activeSession,
         lobby: result.lobby,
@@ -464,6 +484,7 @@ function App() {
       setSymbols([]);
       setBook({ symbol, bids: [], asks: [] });
       setMarketPrice(null);
+      setMarketTrades([]);
       pushActivity(
         "Exited session",
         result.cooldownRemainingSeconds > 0
@@ -475,6 +496,23 @@ function App() {
     } catch (error) {
       pushActivity("Exit failed", error instanceof Error ? error.message : "Request failed", false);
     }
+  }
+
+  function handleFocusActiveSession() {
+    if (!activeSession) {
+      return;
+    }
+
+    setRoomId(activeSession.roomId);
+    if (activeSession.competitive) {
+      setLobbyId(activeSession.id);
+    }
+
+    setMembership(null);
+    setSymbols([]);
+    setBook({ symbol, bids: [], asks: [] });
+    setMarketPrice(null);
+    setMarketTrades([]);
   }
 
   const spread = book.bids.length > 0 && book.asks.length > 0 ? book.asks[0].price - book.bids[0].price : null;
@@ -517,53 +555,6 @@ function App() {
           <input value={apiBase} onChange={(event) => setApiBase(event.target.value)} />
         </label>
         <label>
-          Room
-          <select
-            value={roomId}
-            onChange={(event) => {
-              setRoomId(event.target.value);
-              setMembership(null);
-              setSymbols([]);
-              setBook({ symbol, bids: [], asks: [] });
-              setMarketPrice(null);
-            }}
-          >
-            {rooms.length === 0 ? (
-              <option value={roomId}>{roomId}</option>
-            ) : (
-              rooms.map((room) => (
-                <option key={room.id} value={room.id}>
-                  {room.name}
-                </option>
-              ))
-            )}
-          </select>
-        </label>
-        <label>
-          Lobby
-          <select
-            value={isCompetitive ? lobbyId : ""}
-            disabled={!isCompetitive}
-            onChange={(event) => {
-              setLobbyId(event.target.value);
-              setMembership(null);
-              setSymbols([]);
-              setBook({ symbol, bids: [], asks: [] });
-              setMarketPrice(null);
-            }}
-          >
-            {!isCompetitive ? (
-              <option value="">Personal session</option>
-            ) : (
-              lobbies.map((lobby) => (
-                <option key={lobby.id} value={lobby.id}>
-                  {lobby.name} ({lobby.participantCount}/{lobby.capacity})
-                </option>
-              ))
-            )}
-          </select>
-        </label>
-        <label>
           Symbol
           <input
             value={symbol}
@@ -592,46 +583,47 @@ function App() {
               ))
             : null}
         </div>
-        <div className="room-meta">
-          <span>{selectedRoom?.mode ?? "single"}</span>
-          <span>{selectedRoom?.difficulty ?? "dev"}</span>
-          <span>cash {selectedRoom ? formatNumber(selectedRoom.startingCash) : "-"}</span>
-          <span>{selectedAsset?.behavior ?? "locked"}</span>
-          <span>{selectedAsset?.source ?? "locked"}</span>
-          {selectedLobby ? (
-            <>
-              <span>{selectedLobby.participantCount}/{selectedLobby.capacity} players</span>
-              <span>{selectedLobby.phase}</span>
-              {selectedLobby.phase === "starting" ? <span>starts {selectedLobby.startsInSeconds}s</span> : null}
-              {selectedLobby.phase === "running" ? <span>ends {selectedLobby.endsInSeconds}s</span> : null}
-            </>
-          ) : null}
-          {isSignedIn && selectedRoom ? (
-            isEntered ? (
-              <button type="button" className="lobby-action leave" onClick={() => void handleExitSession()}>
-                <LogOut size={16} />
-                Exit
-              </button>
-            ) : (
-              <button
-                type="button"
-                className="lobby-action join"
-                disabled={entryDisabled}
-                onClick={() => void handleEnterSession()}
-              >
-                <UserPlus size={16} />
-                {cooldownRemaining > 0
-                  ? `Wait ${cooldownRemaining}s`
-                  : isCompetitive
-                    ? selectedLobby?.status !== "open"
-                      ? selectedLobby?.status === "full" ? "Lobby full" : "Lobby locked"
-                      : "Join lobby"
-                    : "Enter room"}
-              </button>
-            )
-          ) : null}
-        </div>
       </section>
+
+      <SessionPanel
+        rooms={rooms}
+        lobbies={lobbies}
+        selectedRoom={selectedRoom}
+        selectedLobby={selectedLobby}
+        selectedAsset={selectedAsset}
+        roomId={roomId}
+        lobbyId={lobbyId}
+        isSignedIn={Boolean(isSignedIn)}
+        isEntered={isEntered}
+        isCompetitive={Boolean(isCompetitive)}
+        gameIsRunning={gameIsRunning}
+        cooldownRemaining={cooldownRemaining}
+        entryDisabled={entryDisabled}
+        activeSession={activeSession}
+        activeElsewhere={activeElsewhere}
+        joinTrack={joinTrack}
+        currentTrack={membership?.track}
+        onJoinTrackChange={setJoinTrack}
+        onSelectRoom={(nextRoomId) => {
+          setRoomId(nextRoomId);
+          setMembership(null);
+          setSymbols([]);
+          setBook({ symbol, bids: [], asks: [] });
+          setMarketPrice(null);
+          setMarketTrades([]);
+        }}
+        onSelectLobby={(nextLobbyId) => {
+          setLobbyId(nextLobbyId);
+          setMembership(null);
+          setSymbols([]);
+          setBook({ symbol, bids: [], asks: [] });
+          setMarketPrice(null);
+          setMarketTrades([]);
+        }}
+        onEnter={() => void handleEnterSession()}
+        onExit={() => void handleExitSession()}
+        onFocusActive={handleFocusActiveSession}
+      />
 
       <section className="market-strip">
         <Metric label="Best bid" value={book.bids[0] ? formatNumber(book.bids[0].price) : "-"} />
@@ -759,6 +751,8 @@ function App() {
           </form>
         </section>
 
+        <TradeTapePanel trades={marketTrades} isEntered={canViewMarket} />
+
         <section className="panel activity-panel">
           <div className="panel-title">
             <Activity size={18} />
@@ -787,12 +781,246 @@ function App() {
           fills={fills}
           portfolio={portfolio}
           leaderboard={leaderboard}
+          track={membership?.track}
           isSignedIn={Boolean(isSignedIn)}
           isEntered={isEntered}
           onRefresh={() => void refreshAccount()}
         />
       </div>
     </main>
+  );
+}
+
+function SessionPanel({
+  rooms,
+  lobbies,
+  selectedRoom,
+  selectedLobby,
+  selectedAsset,
+  roomId,
+  lobbyId,
+  isSignedIn,
+  isEntered,
+  isCompetitive,
+  gameIsRunning,
+  cooldownRemaining,
+  entryDisabled,
+  activeSession,
+  activeElsewhere,
+  joinTrack,
+  currentTrack,
+  onJoinTrackChange,
+  onSelectRoom,
+  onSelectLobby,
+  onEnter,
+  onExit,
+  onFocusActive
+}: {
+  rooms: GameRoom[];
+  lobbies: GameLobby[];
+  selectedRoom?: GameRoom;
+  selectedLobby?: GameLobby;
+  selectedAsset?: GameRoom["assets"][number];
+  roomId: string;
+  lobbyId: string;
+  isSignedIn: boolean;
+  isEntered: boolean;
+  isCompetitive: boolean;
+  gameIsRunning: boolean;
+  cooldownRemaining: number;
+  entryDisabled: boolean;
+  activeSession: ActiveSession | null;
+  activeElsewhere: boolean;
+  joinTrack: ParticipantTrack;
+  currentTrack?: ParticipantTrack;
+  onJoinTrackChange: (track: ParticipantTrack) => void;
+  onSelectRoom: (roomId: string) => void;
+  onSelectLobby: (lobbyId: string) => void;
+  onEnter: () => void;
+  onExit: () => void;
+  onFocusActive: () => void;
+}) {
+  const phaseLabel = isCompetitive
+    ? selectedLobby?.phase ?? "waiting"
+    : "live";
+  const timerLabel = !selectedLobby
+    ? `${selectedRoom?.gameDurationSeconds ?? 0}s`
+    : selectedLobby.phase === "starting"
+      ? `starts ${selectedLobby.startsInSeconds}s`
+      : selectedLobby.phase === "running"
+        ? `ends ${selectedLobby.endsInSeconds}s`
+        : `${selectedLobby.gameDurationSeconds}s`;
+
+  return (
+    <section className="panel session-panel">
+      <div className="panel-title">
+        <Server size={18} />
+        <h2>Session</h2>
+      </div>
+
+      <div className="session-layout">
+        <div className="session-column">
+          <div className="section-heading">Rooms</div>
+          <div className="session-list">
+            {rooms.length === 0 ? (
+              <div className="empty-state">No rooms</div>
+            ) : (
+              rooms.map((room) => (
+                <button
+                  key={room.id}
+                  type="button"
+                  className={`session-row ${room.id === roomId ? "selected" : ""}`}
+                  onClick={() => onSelectRoom(room.id)}
+                >
+                  <span className="row-main">
+                    <strong>{room.name}</strong>
+                    <span>{room.mode} / {room.difficulty}</span>
+                  </span>
+                  <span className="row-meta">
+                    <span>{formatNumber(room.startingCash)}</span>
+                    <span>{room.gameDurationSeconds}s</span>
+                  </span>
+                </button>
+              ))
+            )}
+          </div>
+        </div>
+
+        <div className="session-column">
+          <div className="section-heading">{isCompetitive ? "Lobbies" : "Access"}</div>
+          {isCompetitive ? (
+            <div className="session-list">
+              {lobbies.map((lobby) => {
+                const filledPercent = Math.min(100, (lobby.participantCount / Math.max(1, lobby.capacity)) * 100);
+                return (
+                  <button
+                    key={lobby.id}
+                    type="button"
+                    className={`session-row lobby-row ${lobby.id === lobbyId ? "selected" : ""}`}
+                    onClick={() => onSelectLobby(lobby.id)}
+                  >
+                    <span className="row-main">
+                      <strong>{lobby.name}</strong>
+                      <span>{lobby.participantCount}/{lobby.capacity} players / {lobby.phase}</span>
+                      <span className="capacity-bar"><span style={{ width: `${filledPercent}%` }} /></span>
+                    </span>
+                    <span className="row-meta">
+                      <span>{lobby.status}</span>
+                      <span>{lobby.phase === "starting" ? `${lobby.startsInSeconds}s` : `${lobby.spotsRemaining} left`}</span>
+                    </span>
+                  </button>
+                );
+              })}
+            </div>
+          ) : (
+            <div className="session-list">
+              <div className="session-row static-row">
+                <span className="row-main">
+                  <strong>Personal session</strong>
+                  <span>{selectedRoom?.houseLiquidity ? "simulated liquidity" : "manual liquidity"}</span>
+                </span>
+                <span className="row-meta">
+                  <span>1 seat</span>
+                  <span>{selectedRoom?.gameDurationSeconds ?? 0}s</span>
+                </span>
+              </div>
+            </div>
+          )}
+        </div>
+      </div>
+
+      <div className="session-action-row">
+        <div className="state-pills">
+          <span>{selectedRoom?.mode ?? "single"}</span>
+          <span>{phaseLabel}</span>
+          <span>{timerLabel}</span>
+          <span>cash {selectedRoom ? formatNumber(selectedRoom.startingCash) : "-"}</span>
+          <span>{selectedAsset?.behavior ?? "locked"}</span>
+          <span>{selectedAsset?.source ?? "locked"}</span>
+          {activeSession ? <span>active {activeSession.competitive ? activeSession.id : activeSession.roomId}</span> : null}
+          {isEntered && isCompetitive ? <span>{currentTrack ?? joinTrack}</span> : null}
+          {isEntered && !gameIsRunning ? <span>orders locked</span> : null}
+        </div>
+
+        {isCompetitive && !isEntered ? (
+          <div className="join-track">
+            <span>Track</span>
+            <Segmented<ParticipantTrack> value={joinTrack} onChange={onJoinTrackChange} options={[
+              { label: "Manual", value: "manual" },
+              { label: "Bot", value: "bot" }
+            ]} />
+          </div>
+        ) : null}
+
+        {activeElsewhere ? (
+          <button type="button" onClick={onFocusActive}>
+            <PlugZap size={16} />
+            Focus active
+          </button>
+        ) : null}
+
+        {isSignedIn && selectedRoom ? (
+          isEntered ? (
+            <button type="button" className="lobby-action leave" onClick={onExit}>
+              <LogOut size={16} />
+              Exit
+            </button>
+          ) : (
+            <button
+              type="button"
+              className="lobby-action join"
+              disabled={entryDisabled}
+              onClick={onEnter}
+            >
+              <UserPlus size={16} />
+              {cooldownRemaining > 0
+                ? `Wait ${cooldownRemaining}s`
+                : activeElsewhere
+                  ? "Active elsewhere"
+                  : isCompetitive
+                    ? selectedLobby?.status !== "open"
+                      ? selectedLobby?.status === "full" ? "Lobby full" : "Lobby locked"
+                      : "Join lobby"
+                    : "Enter room"}
+            </button>
+          )
+        ) : null}
+      </div>
+    </section>
+  );
+}
+
+function TradeTapePanel({ trades, isEntered }: { trades: MarketTradeRecord[]; isEntered: boolean }) {
+  return (
+    <section className="panel tape-panel">
+      <div className="panel-title">
+        <Activity size={18} />
+        <h2>Trades</h2>
+      </div>
+
+      {!isEntered ? (
+        <div className="locked-state compact">Enter the selected room or lobby to view trades.</div>
+      ) : trades.length === 0 ? (
+        <div className="empty-state">No trades</div>
+      ) : (
+        <div className="trade-list">
+          {trades.slice(0, 16).map((trade) => (
+            <div className="trade-row" key={trade.sequence}>
+              <div className="data-main">
+                <strong>
+                  #{trade.sequence} <span className={`side-chip ${trade.takerSide}`}>{formatSide(trade.takerSide)}</span>
+                </strong>
+                <span>Taker {formatNumber(trade.takerTraderId)} / maker {formatNumber(trade.makerTraderId)}</span>
+              </div>
+              <div className="data-values">
+                <strong>{formatNumber(trade.quantity)} @ {formatNumber(trade.price)}</strong>
+                <span>{formatNumber(trade.notional)}</span>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+    </section>
   );
 }
 
@@ -835,6 +1063,7 @@ function AccountPanel({
   fills,
   portfolio,
   leaderboard,
+  track,
   isSignedIn,
   isEntered,
   onRefresh
@@ -844,6 +1073,7 @@ function AccountPanel({
   fills: FillRecord[];
   portfolio: PortfolioRecord | null;
   leaderboard: LeaderboardRow[];
+  track?: ParticipantTrack;
   isSignedIn: boolean;
   isEntered: boolean;
   onRefresh: () => void;
@@ -910,6 +1140,24 @@ function AccountPanel({
             <div className="account-stat">
               <span>Positions</span>
               <strong>{me ? formatNumber(me.positionCount) : "-"}</strong>
+            </div>
+            {track ? (
+              <div className="account-stat">
+                <span>Track</span>
+                <strong>{track}</strong>
+              </div>
+            ) : null}
+            <div className="account-stat">
+              <span>Trading PnL</span>
+              <strong className={portfolio && portfolio.tradingPnl < 0 ? "sell-text" : "buy-text"}>
+                {portfolio ? formatSignedNumber(portfolio.tradingPnl) : "-"}
+              </strong>
+            </div>
+            <div className="account-stat">
+              <span>Unrealized</span>
+              <strong className={portfolio && portfolio.unrealizedPnl < 0 ? "sell-text" : "buy-text"}>
+                {portfolio ? formatSignedNumber(portfolio.unrealizedPnl) : "-"}
+              </strong>
             </div>
           </div>
 
