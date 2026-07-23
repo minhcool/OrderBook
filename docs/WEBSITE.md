@@ -18,8 +18,11 @@ Terminal 1:
 
 ```powershell
 cd C:\Users\nqmin\Documents\Projects\Orderbook
+$env:CLERK_JWT_KEY = "-----BEGIN PUBLIC KEY-----`n...`n-----END PUBLIC KEY-----"
 mingw32-make api
 ```
+
+For local-only fake token testing, use `$env:ORDERBOOK_ALLOW_UNVERIFIED_JWT = "1"` instead of `CLERK_JWT_KEY`.
 
 Terminal 2:
 
@@ -120,5 +123,6 @@ Portfolio value is estimated from room starting cash, trade cash flow, reserved 
 4. Run `clerk init --app app_3GqtszmnEQINzeFX8CUrXDhCXXz` from `web/`.
 5. Keep the generated `web/.env.local` local; it is intentionally ignored by Git.
 6. Add the publishable key in Vercel as `VITE_CLERK_PUBLISHABLE_KEY`.
+7. Add the JWT public key in Render as `CLERK_JWT_KEY`.
 
-The current backend reads the Clerk token subject and maps it to an internal `TraderId`. It still needs real Clerk JWT verification before production use.
+The backend verifies Clerk session tokens with `CLERK_JWT_KEY`, then maps the verified `sub` claim to an internal `TraderId`.

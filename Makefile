@@ -13,7 +13,7 @@ TEST_BIN := $(BUILD_DIR)/test_orderbook.exe
 DEMO_BIN := $(BUILD_DIR)/orderbook_demo.exe
 PERF_BIN := $(BUILD_DIR)/orderbook_perf.exe
 API_BIN := $(BUILD_DIR)/orderbook_api.exe
-API_LDLIBS ?= -lws2_32
+API_LDLIBS ?= -lssl -lcrypto -lws2_32
 
 .PHONY: all test demo perf api-build api-test api clean
 
@@ -47,6 +47,7 @@ api-build: $(API_BIN)
 
 api-test: $(API_BIN)
 	powershell -ExecutionPolicy Bypass -File tests/test_api_lobbies.ps1
+	powershell -ExecutionPolicy Bypass -File tests/test_api_auth.ps1
 
 api: $(API_BIN)
 	$(API_BIN)

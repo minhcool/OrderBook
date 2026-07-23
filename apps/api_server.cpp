@@ -24,6 +24,10 @@
 #include <utility>
 #include <vector>
 
+#include <openssl/err.h>
+#include <openssl/evp.h>
+#include <openssl/pem.h>
+
 #ifdef ORDERBOOK_WITH_POSTGRES
 #include <libpq-fe.h>
 #endif
@@ -1072,6 +1076,29 @@ std::string lower(std::string value) {
     return value;
 }
 
+std::string envString(const char* name) {
+    const char* value = std::getenv(name);
+    return value == nullptr ? "" : trim(value);
+}
+
+bool envBool(const char* name, bool fallback = false) {
+    const char* value = std::getenv(name);
+    if (value == nullptr || value[0] == '\0') {
+        return fallback;
+    }
+
+    const std::string normalized = lower(trim(value));
+    if (normalized == "1" || normalized == "true" || normalized == "yes" || normalized == "on") {
+        return true;
+    }
+
+    if (normalized == "0" || normalized == "false" || normalized == "no" || normalized == "off") {
+        return false;
+    }
+
+    throw std::runtime_error(std::string("invalid boolean env var: ") + name);
+}
+
 std::string statusText(int status) {
     switch (status) {
         case 200:
@@ -1813,46 +1840,305 @@ int base64UrlValue(char ch) {
     return -1;
 }
 
-std::string base64UrlDecode(const std::string& value) {
-    std::string output;
-    int bits = 0;
+std::vector<unsigned char> base64UrlDecodeBytes(const std::string& value, const std::string& context) {
+    if (value.size() % 4 == 1) {
+        throw AuthError("invalid base64url in " + context);
+    }
+
+    std::vector<unsigned char> output;
+    std::uint32_t bits = 0;
     int bitCount = 0;
+    bool sawPadding = false;
 
     for (char ch : value) {
         if (ch == '=') {
-            break;
+            sawPadding = true;
+            continue;
+        }
+
+        if (sawPadding) {
+            throw AuthError("invalid base64url padding in " + context);
         }
 
         const int decoded = base64UrlValue(ch);
         if (decoded < 0) {
-            continue;
+            throw AuthError("invalid base64url character in " + context);
         }
 
-        bits = (bits << 6) | decoded;
+        bits = (bits << 6) | static_cast<std::uint32_t>(decoded);
         bitCount += 6;
 
-        if (bitCount >= 8) {
+        while (bitCount >= 8) {
             bitCount -= 8;
-            output.push_back(static_cast<char>((bits >> bitCount) & 0xff));
+            output.push_back(static_cast<unsigned char>((bits >> bitCount) & 0xffU));
+            bits = bitCount > 0 ? bits & ((1U << bitCount) - 1U) : 0;
         }
     }
 
     return output;
 }
 
-std::optional<std::string> jwtSubjectWithoutVerification(const std::string& token) {
+std::vector<std::string> splitCommaList(const std::string& value) {
+    std::vector<std::string> result;
+    std::stringstream stream(value);
+    std::string item;
+
+    while (std::getline(stream, item, ',')) {
+        item = trim(item);
+        if (!item.empty()) {
+            result.push_back(item);
+        }
+    }
+
+    return result;
+}
+
+std::vector<std::string> jsonStringArrayField(const std::string& body, const std::string& field) {
+    const std::regex arrayPattern("\"" + field + "\"\\s*:\\s*\\[([^\\]]*)\\]");
+    std::smatch arrayMatch;
+    if (!std::regex_search(body, arrayMatch, arrayPattern)) {
+        return {};
+    }
+
+    std::vector<std::string> values;
+    const std::string arrayBody = arrayMatch[1].str();
+    const std::regex stringPattern("\"([^\"]*)\"");
+    auto begin = std::sregex_iterator(arrayBody.begin(), arrayBody.end(), stringPattern);
+    const auto end = std::sregex_iterator();
+    for (auto it = begin; it != end; ++it) {
+        values.push_back((*it)[1].str());
+    }
+
+    return values;
+}
+
+std::string normalizePem(std::string value) {
+    std::string output;
+    output.reserve(value.size());
+
+    for (std::size_t i = 0; i < value.size(); ++i) {
+        if (value[i] == '\\' && i + 1 < value.size() && value[i + 1] == 'n') {
+            output.push_back('\n');
+            ++i;
+            continue;
+        }
+
+        output.push_back(value[i]);
+    }
+
+    output = trim(output);
+    if (!output.empty() && output.back() != '\n') {
+        output.push_back('\n');
+    }
+
+    return output;
+}
+
+std::string opensslError() {
+    const unsigned long code = ERR_get_error();
+    if (code == 0) {
+        return "unknown OpenSSL error";
+    }
+
+    char buffer[256];
+    ERR_error_string_n(code, buffer, sizeof(buffer));
+    return buffer;
+}
+
+struct AuthConfig {
+    std::string jwtPublicKeyPem;
+    std::string issuer;
+    std::vector<std::string> audiences;
+    std::vector<std::string> authorizedParties;
+    bool allowUnverifiedJwt = false;
+    std::int64_t clockSkewSeconds = 60;
+
+    static AuthConfig fromEnvironment() {
+        AuthConfig config;
+        config.jwtPublicKeyPem = normalizePem(envString("CLERK_JWT_KEY"));
+        config.issuer = envString("CLERK_ISSUER");
+        config.audiences = splitCommaList(envString("CLERK_AUDIENCE"));
+        config.authorizedParties = splitCommaList(envString("CLERK_AUTHORIZED_PARTIES"));
+        config.allowUnverifiedJwt = envBool("ORDERBOOK_ALLOW_UNVERIFIED_JWT", false);
+        config.clockSkewSeconds = envInt64("ORDERBOOK_AUTH_CLOCK_SKEW_SECONDS", config.clockSkewSeconds);
+        if (config.clockSkewSeconds < 0) {
+            config.clockSkewSeconds = 0;
+        }
+
+        return config;
+    }
+};
+
+const AuthConfig& authConfig() {
+    static const AuthConfig config = AuthConfig::fromEnvironment();
+    return config;
+}
+
+struct JwtParts {
+    std::string signingInput;
+    std::string headerJson;
+    std::string payloadJson;
+    std::vector<unsigned char> signature;
+};
+
+JwtParts parseJwt(const std::string& token) {
     const std::size_t firstDot = token.find('.');
     if (firstDot == std::string::npos) {
-        return std::nullopt;
+        throw AuthError("bearer token must be a JWT");
     }
 
     const std::size_t secondDot = token.find('.', firstDot + 1);
-    if (secondDot == std::string::npos) {
-        return std::nullopt;
+    if (secondDot == std::string::npos || token.find('.', secondDot + 1) != std::string::npos) {
+        throw AuthError("bearer token must have three JWT segments");
     }
 
-    const std::string payload = base64UrlDecode(token.substr(firstDot + 1, secondDot - firstDot - 1));
-    return jsonStringField(payload, "sub");
+    JwtParts parts;
+    const std::string headerSegment = token.substr(0, firstDot);
+    const std::string payloadSegment = token.substr(firstDot + 1, secondDot - firstDot - 1);
+    const std::string signatureSegment = token.substr(secondDot + 1);
+    parts.signingInput = token.substr(0, secondDot);
+
+    const std::vector<unsigned char> header = base64UrlDecodeBytes(headerSegment, "jwt header");
+    const std::vector<unsigned char> payload = base64UrlDecodeBytes(payloadSegment, "jwt payload");
+    parts.headerJson = std::string(header.begin(), header.end());
+    parts.payloadJson = std::string(payload.begin(), payload.end());
+    parts.signature = base64UrlDecodeBytes(signatureSegment, "jwt signature");
+
+    return parts;
+}
+
+bool containsValue(const std::vector<std::string>& values, const std::string& candidate) {
+    return std::find(values.begin(), values.end(), candidate) != values.end();
+}
+
+bool jwtAudienceMatches(const std::string& payloadJson, const std::vector<std::string>& allowedAudiences) {
+    const std::optional<std::string> stringAudience = jsonStringField(payloadJson, "aud");
+    if (stringAudience && containsValue(allowedAudiences, *stringAudience)) {
+        return true;
+    }
+
+    const std::vector<std::string> arrayAudience = jsonStringArrayField(payloadJson, "aud");
+    for (const std::string& audience : arrayAudience) {
+        if (containsValue(allowedAudiences, audience)) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+bool verifyRs256Signature(
+    const std::string& publicKeyPem,
+    const std::string& signingInput,
+    const std::vector<unsigned char>& signature) {
+    BIO* bio = BIO_new_mem_buf(publicKeyPem.data(), static_cast<int>(publicKeyPem.size()));
+    if (bio == nullptr) {
+        throw AuthError("failed to load Clerk JWT public key: " + opensslError());
+    }
+
+    EVP_PKEY* publicKey = PEM_read_bio_PUBKEY(bio, nullptr, nullptr, nullptr);
+    BIO_free(bio);
+    if (publicKey == nullptr) {
+        throw AuthError("failed to parse CLERK_JWT_KEY PEM public key: " + opensslError());
+    }
+
+    EVP_MD_CTX* context = EVP_MD_CTX_new();
+    if (context == nullptr) {
+        EVP_PKEY_free(publicKey);
+        throw AuthError("failed to allocate JWT verifier: " + opensslError());
+    }
+
+    if (EVP_DigestVerifyInit(context, nullptr, EVP_sha256(), nullptr, publicKey) != 1) {
+        EVP_MD_CTX_free(context);
+        EVP_PKEY_free(publicKey);
+        throw AuthError("failed to initialize JWT verifier: " + opensslError());
+    }
+
+    if (EVP_DigestVerifyUpdate(context, signingInput.data(), signingInput.size()) != 1) {
+        EVP_MD_CTX_free(context);
+        EVP_PKEY_free(publicKey);
+        throw AuthError("failed to hash JWT signing input: " + opensslError());
+    }
+
+    const int result = EVP_DigestVerifyFinal(context, signature.data(), signature.size());
+    EVP_MD_CTX_free(context);
+    EVP_PKEY_free(publicKey);
+
+    if (result < 0) {
+        throw AuthError("failed during JWT signature verification: " + opensslError());
+    }
+
+    return result == 1;
+}
+
+void validateJwtClaims(const std::string& payloadJson, const AuthConfig& config) {
+    const auto expiration = jsonIntField(payloadJson, "exp");
+    if (!expiration) {
+        throw AuthError("Clerk JWT missing exp claim");
+    }
+
+    const std::int64_t now = epochSeconds(Clock::now());
+    if (*expiration + config.clockSkewSeconds < now) {
+        throw AuthError("Clerk JWT is expired");
+    }
+
+    const auto notBefore = jsonIntField(payloadJson, "nbf");
+    if (notBefore && *notBefore - config.clockSkewSeconds > now) {
+        throw AuthError("Clerk JWT is not active yet");
+    }
+
+    if (!config.issuer.empty()) {
+        const auto issuer = jsonStringField(payloadJson, "iss");
+        if (!issuer || *issuer != config.issuer) {
+            throw AuthError("Clerk JWT issuer does not match CLERK_ISSUER");
+        }
+    }
+
+    if (!config.audiences.empty() && !jwtAudienceMatches(payloadJson, config.audiences)) {
+        throw AuthError("Clerk JWT audience is not allowed");
+    }
+
+    if (!config.authorizedParties.empty()) {
+        const auto authorizedParty = jsonStringField(payloadJson, "azp");
+        if (!authorizedParty || !containsValue(config.authorizedParties, *authorizedParty)) {
+            throw AuthError("Clerk JWT authorized party is not allowed");
+        }
+    }
+}
+
+std::optional<std::string> jwtSubjectForAuthentication(const std::string& token) {
+    try {
+        const JwtParts parts = parseJwt(token);
+        const std::optional<std::string> subject = jsonStringField(parts.payloadJson, "sub");
+        if (!subject || subject->empty()) {
+            throw AuthError("bearer token must be a Clerk JWT with a sub claim");
+        }
+
+        const AuthConfig& config = authConfig();
+        if (config.allowUnverifiedJwt) {
+            return subject;
+        }
+
+        if (config.jwtPublicKeyPem.empty()) {
+            throw AuthError("CLERK_JWT_KEY is required; set ORDERBOOK_ALLOW_UNVERIFIED_JWT=1 only for local prototype tests");
+        }
+
+        const std::optional<std::string> algorithm = jsonStringField(parts.headerJson, "alg");
+        if (!algorithm || *algorithm != "RS256") {
+            throw AuthError("Clerk JWT must use RS256");
+        }
+
+        if (!verifyRs256Signature(config.jwtPublicKeyPem, parts.signingInput, parts.signature)) {
+            throw AuthError("Clerk JWT signature verification failed");
+        }
+
+        validateJwtClaims(parts.payloadJson, config);
+        return subject;
+    } catch (const AuthError&) {
+        throw;
+    } catch (const std::exception&) {
+        return std::nullopt;
+    }
 }
 
 TraderId traderIdFromSubject(const std::string& subject) {
@@ -1876,7 +2162,7 @@ AuthenticatedUser authenticatedUser(const HttpRequest& request) {
         throw AuthError("missing Authorization bearer token");
     }
 
-    const std::optional<std::string> subject = jwtSubjectWithoutVerification(*token);
+    const std::optional<std::string> subject = jwtSubjectForAuthentication(*token);
     if (!subject || subject->empty()) {
         throw AuthError("bearer token must be a Clerk JWT with a sub claim");
     }
@@ -4215,6 +4501,7 @@ int main(int argc, char** argv) {
         SocketRuntime runtime;
         SocketHandle server = createServerSocket(port);
         GameConfig config = GameConfig::fromEnvironment();
+        const AuthConfig& auth = authConfig();
         PersistenceStore persistence;
         RoomStore rooms(config);
         rooms.ratings(ParticipantTrack::Manual) = persistence.loadRatings(ParticipantTrack::Manual);
@@ -4226,6 +4513,14 @@ int main(int argc, char** argv) {
                   << ", competitive start delay: " << config.startDelaySeconds
                   << "s, game duration: " << config.gameDurationSeconds
                   << "s, rejoin cooldown: " << config.rejoinCooldownSeconds << "s\n";
+        if (auth.allowUnverifiedJwt) {
+            std::cerr << "WARNING: ORDERBOOK_ALLOW_UNVERIFIED_JWT is enabled. "
+                      << "Use only for local prototype tests.\n";
+        } else if (auth.jwtPublicKeyPem.empty()) {
+            std::cerr << "Auth: CLERK_JWT_KEY is not set; authenticated endpoints will reject requests.\n";
+        } else {
+            std::cout << "Auth: Clerk JWT signature verification enabled.\n";
+        }
         if (persistence.enabled()) {
             std::cout << "Replayed " << restoreStats.events << " persisted events ("
                       << restoreStats.sessions << " session, "

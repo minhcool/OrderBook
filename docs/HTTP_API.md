@@ -41,7 +41,30 @@ Stop it with `Ctrl+C`.
 - The parser is intentionally tiny and only supports the fields shown here.
 - POST order endpoints and `/me` endpoints require `Authorization: Bearer <Clerk session token>`.
 - Missing or malformed bearer tokens return `401`.
-- The current C++ server derives `TraderId` from the Clerk JWT `sub` claim, but does not yet verify the JWT signature against Clerk JWKS. Add real JWT verification before making trading public.
+- The C++ server verifies Clerk JWT signatures with `CLERK_JWT_KEY`, then derives `TraderId` from the verified `sub` claim. Set `ORDERBOOK_ALLOW_UNVERIFIED_JWT=1` only for local prototype tests.
+
+## Auth Environment
+
+Required for deployed auth:
+
+```text
+CLERK_JWT_KEY="-----BEGIN PUBLIC KEY-----
+...
+-----END PUBLIC KEY-----"
+```
+
+Get this from Clerk Dashboard -> API keys -> JWT public key. The value can also use escaped newlines (`\n`) if your host stores secrets on one line.
+
+Optional extra checks:
+
+```text
+CLERK_ISSUER=https://your-clerk-issuer
+CLERK_AUDIENCE=api-audience-one,api-audience-two
+CLERK_AUTHORIZED_PARTIES=https://your-vercel-app.vercel.app,https://your-domain.com
+ORDERBOOK_AUTH_CLOCK_SKEW_SECONDS=60
+```
+
+`CLERK_ISSUER` checks `iss`, `CLERK_AUDIENCE` checks `aud`, and `CLERK_AUTHORIZED_PARTIES` checks Clerk's `azp` claim.
 
 ## GET Endpoints
 

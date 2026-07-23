@@ -6,7 +6,7 @@ Bots use the same HTTP API as the website. For now, authentication is a Clerk se
 Authorization: Bearer <token>
 ```
 
-The backend derives the internal `traderId` from the token's `sub` claim. JWT signature verification is still a prototype limitation, so do not treat this as production security yet.
+The backend verifies the Clerk JWT signature with `CLERK_JWT_KEY`, then derives the internal `traderId` from the verified token's `sub` claim. Local fake tokens work only when the API server is started with `ORDERBOOK_ALLOW_UNVERIFIED_JWT=1`.
 
 ## Competitive Bot Flow
 
@@ -104,11 +104,11 @@ python examples/simple_bot.py --mode single --iterations 10
 
 By default, the script joins `solo-alpha`, advances the simulator, reads the book and portfolio, then alternates small IOC buys/sells. Use `--mode competitive --lobby aurora-open-10` to join a competitive lobby on the bot track.
 
-For local prototype testing without Clerk, omit `ORDERBOOK_BOT_TOKEN`; the script creates a development token with a `sub` claim. Do not rely on that once real JWT verification is enabled.
+For local prototype testing without Clerk, start the API with `ORDERBOOK_ALLOW_UNVERIFIED_JWT=1` and omit `ORDERBOOK_BOT_TOKEN`; the script creates a development token with a `sub` claim. Do not set that flag on Render.
 
 ## Current Limits
 
 - No WebSocket stream yet; bots should poll.
-- No API-key auth yet; bots currently need a Clerk session token.
+- No API-key auth yet; deployed bots currently need a valid Clerk session token.
 - Competitive bots must join before the lobby starts unless they were already admitted and are rejoining after cooldown.
 - Rate limits and bot tournament scheduling are not implemented yet.

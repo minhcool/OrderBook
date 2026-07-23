@@ -21,9 +21,26 @@ The included `render.yaml` uses Render's free web service plan for the prototype
 2. Open Render and create a new Blueprint or Web Service from the GitHub repo.
 3. If Render asks for a runtime, choose Docker.
 4. Use the repo root as the service root.
-5. Let Render build and deploy.
-6. After deploy, copy the public service URL.
-7. In Render's Blueprint sync page, confirm both `orderbook-api` and `orderbook-db` exist.
+5. Add the Clerk JWT public key when Render prompts for `CLERK_JWT_KEY`.
+6. Let Render build and deploy.
+7. After deploy, copy the public service URL.
+8. In Render's Blueprint sync page, confirm both `orderbook-api` and `orderbook-db` exist.
+
+`CLERK_JWT_KEY` is the JWT public key from Clerk Dashboard -> API keys. It starts with:
+
+```text
+-----BEGIN PUBLIC KEY-----
+```
+
+Do not use the Clerk publishable key (`pk_...`) here. The API uses this public key to verify signed Clerk session tokens.
+
+Optional Render environment variables:
+
+```text
+CLERK_ISSUER=https://your-clerk-issuer
+CLERK_AUTHORIZED_PARTIES=https://your-vercel-app.vercel.app
+CLERK_AUDIENCE=your-api-audience
+```
 
 The API exposes:
 
@@ -81,6 +98,6 @@ The website also stores the API URL in browser local storage after you click Con
 - Checkpoint rows are replay watermarks right now; full state snapshot fast-forwarding is not implemented yet.
 - Older history rows from before the replay-log migration are not enough to rebuild live state.
 - Render free Postgres expires after its free-tier window; use a paid database before relying on durable history.
-- The backend reads the Clerk token subject but does not verify the JWT signature yet.
+- Authenticated endpoints require verified Clerk JWTs unless `ORDERBOOK_ALLOW_UNVERIFIED_JWT=1` is explicitly set for local tests. Do not set that flag on Render.
 - CORS is currently open for development.
 - This is a prototype deployment path, not a production trading system.

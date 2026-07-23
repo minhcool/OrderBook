@@ -12,6 +12,8 @@ services:
         fromDatabase:
           name: orderbook-db
           property: connectionString
+      - key: CLERK_JWT_KEY
+        sync: false
       - key: ORDERBOOK_START_DELAY_SECONDS
         value: "90"
       - key: ORDERBOOK_GAME_DURATION_SECONDS

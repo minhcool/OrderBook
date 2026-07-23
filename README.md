@@ -12,6 +12,7 @@ The project currently provides an in-memory orderbook library with:
 - cancel by order ID
 - trader IDs and self-trade prevention
 - Clerk login support in the website
+- Clerk JWT signature verification in the API with `CLERK_JWT_KEY`
 - server-assigned HTTP order IDs
 - authenticated open-order, fill-history, and derived-position endpoints
 - room/lobby trade tape, last-trade marks, and simple portfolio valuation
@@ -62,6 +63,7 @@ docs/                  API reference
 ## Requirements
 
 - C++20 compiler, tested with `g++`
+- OpenSSL development libraries for the API server JWT verifier
 - `mingw32-make` on Windows
 
 ## Quickstart
@@ -113,6 +115,13 @@ mingw32-make api-test
 ```
 
 Run the example single-player bot against a local API server:
+
+```powershell
+$env:ORDERBOOK_ALLOW_UNVERIFIED_JWT = "1"
+mingw32-make api
+```
+
+In another terminal:
 
 ```powershell
 python examples/simple_bot.py --api http://localhost:8080 --mode single --iterations 10
@@ -168,7 +177,7 @@ For bot clients, see [docs/BOT_API.md](docs/BOT_API.md).
 - Local HTTP API exists for testing, but it is not production-grade.
 - No WebSocket/FIX API yet; live updates currently use polling.
 - Website uses Clerk login, but roles are not implemented yet.
-- Backend JWT signature verification is not implemented yet; the current API auth bridge is for development.
+- Local fake-token auth requires explicitly setting `ORDERBOOK_ALLOW_UNVERIFIED_JWT=1`.
 - PostgreSQL restore replays the ordered event log from the beginning; checkpoint rows are watermarks, not full snapshot fast-forward restore yet.
 - Events created before the replay-log migration remain history-only and are not enough to rebuild live state.
 - No deposits, withdrawals, margin, or settlement.
