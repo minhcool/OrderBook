@@ -4,10 +4,12 @@
 #include <atomic>
 #include <cctype>
 #include <chrono>
+#include <condition_variable>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <exception>
+#include <functional>
 #include <iomanip>
 #include <iostream>
 #include <limits>
@@ -20,6 +22,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -56,6 +59,7 @@ struct HttpRequest {
     std::string path;
     std::unordered_map<std::string, std::string> headers;
     std::string body;
+    std::string clientIp;
 };
 
 struct HttpResponse {
@@ -620,6 +624,7 @@ struct GameRoom {
     OrderIdGenerator orderIds;
     std::vector<AssetConfig> assets;
     std::map<std::string, SimulatorSymbolState> simulator;
+    mutable std::mutex marketMutex;
 };
 
 struct ParsedRoomPath {
@@ -893,6 +898,13 @@ struct CompetitiveLobby {
         return ratingsFinalized;
     }
 
+    void forceFinish() {
+        std::lock_guard<std::mutex> lock(participantMutex);
+        phase = LobbyPhase::Finished;
+        startsAt.reset();
+        endsAt = Clock::now();
+    }
+
     std::vector<LeaderboardRow> leaderboardRows() const {
         std::lock_guard<std::mutex> lock(participantMutex);
         return leaderboard;
@@ -995,6 +1007,8 @@ public:
     bool hasActiveSession(TraderId traderId, const std::string& sessionId) const;
     std::optional<ActiveSession> activeSessionFor(TraderId traderId) const;
     std::int64_t cooldownRemainingSeconds(TraderId traderId) const;
+    std::size_t activeSessionCount() const;
+    std::size_t singleSessionCount() const;
     const GameConfig& config() const;
     std::unordered_map<TraderId, int>& ratings(ParticipantTrack track);
     bool storeLeaderboardRatings(const CompetitiveLobby& lobby);
@@ -1115,6 +1129,8 @@ std::string statusText(int status) {
             return "Method Not Allowed";
         case 409:
             return "Conflict";
+        case 429:
+            return "Too Many Requests";
         case 500:
             return "Internal Server Error";
         default:
@@ -1912,6 +1928,30 @@ std::vector<std::string> jsonStringArrayField(const std::string& body, const std
     return values;
 }
 
+struct BotCredential {
+    std::string name;
+    std::string token;
+};
+
+std::vector<BotCredential> parseBotCredentials(const std::string& value) {
+    std::vector<BotCredential> credentials;
+    for (const std::string& entry : splitCommaList(value)) {
+        const std::size_t separator = entry.find_first_of(":=");
+        if (separator == std::string::npos || separator == 0 || separator + 1 >= entry.size()) {
+            throw std::runtime_error("invalid ORDERBOOK_BOT_KEYS entry; expected name:token");
+        }
+
+        BotCredential credential{trim(entry.substr(0, separator)), trim(entry.substr(separator + 1))};
+        if (credential.name.empty() || credential.token.empty()) {
+            throw std::runtime_error("invalid ORDERBOOK_BOT_KEYS entry; expected name:token");
+        }
+
+        credentials.push_back(std::move(credential));
+    }
+
+    return credentials;
+}
+
 std::string normalizePem(std::string value) {
     std::string output;
     output.reserve(value.size());
@@ -1950,6 +1990,8 @@ struct AuthConfig {
     std::string issuer;
     std::vector<std::string> audiences;
     std::vector<std::string> authorizedParties;
+    std::vector<BotCredential> botCredentials;
+    std::string adminToken;
     bool allowUnverifiedJwt = false;
     std::int64_t clockSkewSeconds = 60;
 
@@ -1959,6 +2001,8 @@ struct AuthConfig {
         config.issuer = envString("CLERK_ISSUER");
         config.audiences = splitCommaList(envString("CLERK_AUDIENCE"));
         config.authorizedParties = splitCommaList(envString("CLERK_AUTHORIZED_PARTIES"));
+        config.botCredentials = parseBotCredentials(envString("ORDERBOOK_BOT_KEYS"));
+        config.adminToken = envString("ORDERBOOK_ADMIN_TOKEN");
         config.allowUnverifiedJwt = envBool("ORDERBOOK_ALLOW_UNVERIFIED_JWT", false);
         config.clockSkewSeconds = envInt64("ORDERBOOK_AUTH_CLOCK_SKEW_SECONDS", config.clockSkewSeconds);
         if (config.clockSkewSeconds < 0) {
@@ -2141,6 +2185,29 @@ std::optional<std::string> jwtSubjectForAuthentication(const std::string& token)
     }
 }
 
+bool constantTimeEquals(const std::string& left, const std::string& right) {
+    if (left.size() != right.size()) {
+        return false;
+    }
+
+    unsigned char diff = 0;
+    for (std::size_t i = 0; i < left.size(); ++i) {
+        diff |= static_cast<unsigned char>(left[i] ^ right[i]);
+    }
+
+    return diff == 0;
+}
+
+std::optional<std::string> botSubjectForAuthentication(const std::string& token) {
+    for (const BotCredential& credential : authConfig().botCredentials) {
+        if (constantTimeEquals(token, credential.token)) {
+            return "bot:" + credential.name;
+        }
+    }
+
+    return std::nullopt;
+}
+
 TraderId traderIdFromSubject(const std::string& subject) {
     std::uint64_t hash = 1469598103934665603ULL;
     for (unsigned char ch : subject) {
@@ -2154,6 +2221,7 @@ TraderId traderIdFromSubject(const std::string& subject) {
 struct AuthenticatedUser {
     TraderId traderId = 0;
     std::string subject;
+    bool bot = false;
 };
 
 AuthenticatedUser authenticatedUser(const HttpRequest& request) {
@@ -2162,16 +2230,292 @@ AuthenticatedUser authenticatedUser(const HttpRequest& request) {
         throw AuthError("missing Authorization bearer token");
     }
 
+    const std::optional<std::string> botSubject = botSubjectForAuthentication(*token);
+    if (botSubject) {
+        return {traderIdFromSubject(*botSubject), *botSubject, true};
+    }
+
     const std::optional<std::string> subject = jwtSubjectForAuthentication(*token);
     if (!subject || subject->empty()) {
         throw AuthError("bearer token must be a Clerk JWT with a sub claim");
     }
 
-    return {traderIdFromSubject(*subject), *subject};
+    return {traderIdFromSubject(*subject), *subject, false};
 }
 
 TraderId authenticatedTraderId(const HttpRequest& request) {
     return authenticatedUser(request).traderId;
+}
+
+struct ServerConfig {
+    int requestRateLimitPerMinute = 240;
+    int mutationRateLimitPerMinute = 80;
+    int liveWaitMilliseconds = 2500;
+
+    static ServerConfig fromEnvironment() {
+        ServerConfig config;
+        config.requestRateLimitPerMinute = static_cast<int>(std::max<std::int64_t>(
+            0,
+            envInt64("ORDERBOOK_RATE_LIMIT_PER_MINUTE", config.requestRateLimitPerMinute)));
+        config.mutationRateLimitPerMinute = static_cast<int>(std::max<std::int64_t>(
+            0,
+            envInt64("ORDERBOOK_MUTATION_RATE_LIMIT_PER_MINUTE", config.mutationRateLimitPerMinute)));
+        config.liveWaitMilliseconds = static_cast<int>(std::max<std::int64_t>(
+            500,
+            std::min<std::int64_t>(envInt64("ORDERBOOK_LIVE_WAIT_MS", config.liveWaitMilliseconds), 30000)));
+        return config;
+    }
+};
+
+const ServerConfig& serverConfig() {
+    static const ServerConfig config = ServerConfig::fromEnvironment();
+    return config;
+}
+
+class MetricsStore {
+public:
+    MetricsStore()
+        : startedAt(epochSeconds(Clock::now())) {}
+
+    void recordRequest() {
+        requestsTotal.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    void recordResponse(int status) {
+        if (status >= 200 && status < 300) {
+            responses2xx.fetch_add(1, std::memory_order_relaxed);
+        } else if (status >= 400 && status < 500) {
+            responses4xx.fetch_add(1, std::memory_order_relaxed);
+        } else if (status >= 500) {
+            responses5xx.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+
+    void recordRateLimited() {
+        rateLimitedTotal.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    void recordAuthFailure() {
+        authFailuresTotal.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    void recordOrderResult(const SubmitResult& result) {
+        ordersTotal.fetch_add(1, std::memory_order_relaxed);
+        if (result.accepted) {
+            acceptedOrdersTotal.fetch_add(1, std::memory_order_relaxed);
+        }
+        tradesTotal.fetch_add(result.trades.size(), std::memory_order_relaxed);
+        tradedQuantityTotal.fetch_add(result.filledQuantity, std::memory_order_relaxed);
+    }
+
+    void recordCancel(bool canceled) {
+        cancelsTotal.fetch_add(1, std::memory_order_relaxed);
+        if (canceled) {
+            acceptedCancelsTotal.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+
+    void recordSimulatorTick(int steps) {
+        simulatorTicksTotal.fetch_add(static_cast<std::uint64_t>(std::max(0, steps)), std::memory_order_relaxed);
+    }
+
+    void recordAdminAction() {
+        adminActionsTotal.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    std::int64_t startedAt = 0;
+    std::atomic<std::uint64_t> requestsTotal{0};
+    std::atomic<std::uint64_t> responses2xx{0};
+    std::atomic<std::uint64_t> responses4xx{0};
+    std::atomic<std::uint64_t> responses5xx{0};
+    std::atomic<std::uint64_t> rateLimitedTotal{0};
+    std::atomic<std::uint64_t> authFailuresTotal{0};
+    std::atomic<std::uint64_t> ordersTotal{0};
+    std::atomic<std::uint64_t> acceptedOrdersTotal{0};
+    std::atomic<std::uint64_t> cancelsTotal{0};
+    std::atomic<std::uint64_t> acceptedCancelsTotal{0};
+    std::atomic<std::uint64_t> tradesTotal{0};
+    std::atomic<std::uint64_t> tradedQuantityTotal{0};
+    std::atomic<std::uint64_t> simulatorTicksTotal{0};
+    std::atomic<std::uint64_t> adminActionsTotal{0};
+};
+
+struct RateLimitDecision {
+    bool allowed = true;
+    int limit = 0;
+    int remaining = 0;
+    int retryAfterSeconds = 0;
+};
+
+class RateLimiter {
+public:
+    RateLimitDecision allow(const std::string& key, int limit) {
+        if (limit <= 0) {
+            return {true, limit, limit, 0};
+        }
+
+        const TimePoint now = Clock::now();
+        std::lock_guard<std::mutex> lock(rateMutex);
+        Bucket& bucket = buckets[key];
+        if (bucket.windowStart.time_since_epoch().count() == 0
+            || now - bucket.windowStart >= std::chrono::minutes(1)) {
+            bucket.windowStart = now;
+            bucket.count = 0;
+        }
+
+        const int elapsed = static_cast<int>(
+            std::chrono::duration_cast<std::chrono::seconds>(now - bucket.windowStart).count());
+        const int retryAfter = std::max(1, 60 - elapsed);
+        if (bucket.count >= limit) {
+            return {false, limit, 0, retryAfter};
+        }
+
+        ++bucket.count;
+        return {true, limit, std::max(0, limit - bucket.count), retryAfter};
+    }
+
+private:
+    struct Bucket {
+        TimePoint windowStart{};
+        int count = 0;
+    };
+
+    std::mutex rateMutex;
+    std::unordered_map<std::string, Bucket> buckets;
+};
+
+struct LiveUpdate {
+    std::uint64_t sequence = 0;
+    std::string scope;
+    std::string type = "heartbeat";
+    std::string symbol;
+    std::int64_t createdAt = 0;
+};
+
+class LiveUpdateHub {
+public:
+    LiveUpdate publish(const std::string& scope, const std::string& type, const std::string& symbol = "") {
+        std::lock_guard<std::mutex> lock(updateMutex);
+        LiveUpdate update{
+            nextSequence++,
+            scope,
+            type,
+            symbol,
+            epochSeconds(Clock::now()),
+        };
+        latestByScope[scope] = update;
+        updateCondition.notify_all();
+        return update;
+    }
+
+    LiveUpdate waitFor(const std::string& scope, std::uint64_t since, std::chrono::milliseconds timeout) {
+        std::unique_lock<std::mutex> lock(updateMutex);
+        updateCondition.wait_for(lock, timeout, [&] {
+            const auto found = latestByScope.find(scope);
+            return found != latestByScope.end() && found->second.sequence > since;
+        });
+
+        const auto found = latestByScope.find(scope);
+        if (found != latestByScope.end()) {
+            return found->second;
+        }
+
+        return {0, scope, "heartbeat", "", epochSeconds(Clock::now())};
+    }
+
+private:
+    std::mutex updateMutex;
+    std::condition_variable updateCondition;
+    std::uint64_t nextSequence = 1;
+    std::unordered_map<std::string, LiveUpdate> latestByScope;
+};
+
+std::optional<std::string> headerValue(const HttpRequest& request, const std::string& name) {
+    const auto found = request.headers.find(lower(name));
+    if (found == request.headers.end()) {
+        return std::nullopt;
+    }
+
+    return found->second;
+}
+
+std::uint64_t stableHash(const std::string& value) {
+    std::uint64_t hash = 1469598103934665603ULL;
+    for (unsigned char ch : value) {
+        hash ^= ch;
+        hash *= 1099511628211ULL;
+    }
+
+    return hash;
+}
+
+std::string forwardedOrSocketIp(const HttpRequest& request) {
+    const std::optional<std::string> forwarded = headerValue(request, "x-forwarded-for");
+    if (forwarded && !forwarded->empty()) {
+        const std::size_t comma = forwarded->find(',');
+        return trim(comma == std::string::npos ? *forwarded : forwarded->substr(0, comma));
+    }
+
+    return request.clientIp.empty() ? "unknown" : request.clientIp;
+}
+
+std::string rateLimitKey(const HttpRequest& request) {
+    const std::optional<std::string> token = bearerToken(request);
+    if (token) {
+        return "auth:" + std::to_string(stableHash(*token));
+    }
+
+    return "ip:" + forwardedOrSocketIp(request);
+}
+
+bool isMutationRequest(const HttpRequest& request) {
+    return request.method == "POST";
+}
+
+RateLimitDecision enforceRateLimit(const HttpRequest& request, RateLimiter& limiter, const ServerConfig& config) {
+    const std::string key = rateLimitKey(request);
+    RateLimitDecision decision = limiter.allow("request:" + key, config.requestRateLimitPerMinute);
+    if (!decision.allowed || !isMutationRequest(request)) {
+        return decision;
+    }
+
+    return limiter.allow("mutation:" + key, config.mutationRateLimitPerMinute);
+}
+
+void requireAdmin(const HttpRequest& request) {
+    const std::string& adminToken = authConfig().adminToken;
+    if (adminToken.empty()) {
+        throw AuthError("ORDERBOOK_ADMIN_TOKEN is not configured");
+    }
+
+    const std::optional<std::string> headerToken = headerValue(request, "x-admin-token");
+    if (headerToken && constantTimeEquals(*headerToken, adminToken)) {
+        return;
+    }
+
+    const std::optional<std::string> bearer = bearerToken(request);
+    if (bearer && constantTimeEquals(*bearer, adminToken)) {
+        return;
+    }
+
+    throw AuthError("invalid admin token");
+}
+
+std::string sessionScopeKey(RoomMode mode, const std::string& sessionId) {
+    return mode == RoomMode::Competitive ? "lobby:" + sessionId : "session:" + sessionId;
+}
+
+std::string serializeLiveUpdate(const LiveUpdate& update, std::uint64_t since) {
+    std::ostringstream out;
+    out << "{"
+        << "\"sequence\":" << update.sequence << ","
+        << "\"changed\":" << (update.sequence > since ? "true" : "false") << ","
+        << "\"scope\":\"" << jsonEscape(update.scope) << "\","
+        << "\"type\":\"" << jsonEscape(update.type) << "\","
+        << "\"symbol\":\"" << jsonEscape(update.symbol) << "\","
+        << "\"createdAt\":" << update.createdAt
+        << "}";
+    return out.str();
 }
 
 class PersistenceStore {
@@ -2203,6 +2547,7 @@ public:
     std::vector<PersistedEvent> loadReplayEvents() const {
         std::vector<PersistedEvent> events;
 #ifdef ORDERBOOK_WITH_POSTGRES
+        std::lock_guard<std::mutex> lock(persistenceMutex);
         if (connection == nullptr) {
             return events;
         }
@@ -2281,6 +2626,7 @@ public:
         (void)track;
         std::unordered_map<TraderId, int> result;
 #ifdef ORDERBOOK_WITH_POSTGRES
+        std::lock_guard<std::mutex> lock(persistenceMutex);
         if (connection == nullptr) {
             return result;
         }
@@ -2644,6 +2990,7 @@ private:
 
     void exec(const std::string& sql) {
 #ifdef ORDERBOOK_WITH_POSTGRES
+        std::lock_guard<std::mutex> lock(persistenceMutex);
         if (connection == nullptr) {
             return;
         }
@@ -2662,6 +3009,7 @@ private:
 
     void execParams(const std::string& sql, const std::vector<std::string>& params) const {
 #ifdef ORDERBOOK_WITH_POSTGRES
+        std::lock_guard<std::mutex> lock(persistenceMutex);
         if (connection == nullptr) {
             return;
         }
@@ -2694,6 +3042,7 @@ private:
 
     std::int64_t execParamsReturningInt64(const std::string& sql, const std::vector<std::string>& params) const {
 #ifdef ORDERBOOK_WITH_POSTGRES
+        std::lock_guard<std::mutex> lock(persistenceMutex);
         if (connection == nullptr) {
             return 0;
         }
@@ -2730,11 +3079,71 @@ private:
     }
 
     int checkpointEveryEvents = 100;
+    mutable std::mutex persistenceMutex;
 
 #ifdef ORDERBOOK_WITH_POSTGRES
     PGconn* connection = nullptr;
 #endif
 };
+
+std::string serializeMetrics(const MetricsStore& metrics, const RoomStore& rooms, const PersistenceStore& persistence) {
+    const std::int64_t now = epochSeconds(Clock::now());
+    std::ostringstream out;
+    out << "# TYPE orderbook_uptime_seconds gauge\n"
+        << "orderbook_uptime_seconds " << std::max<std::int64_t>(0, now - metrics.startedAt) << "\n"
+        << "# TYPE orderbook_requests_total counter\n"
+        << "orderbook_requests_total " << metrics.requestsTotal.load(std::memory_order_relaxed) << "\n"
+        << "orderbook_responses_2xx_total " << metrics.responses2xx.load(std::memory_order_relaxed) << "\n"
+        << "orderbook_responses_4xx_total " << metrics.responses4xx.load(std::memory_order_relaxed) << "\n"
+        << "orderbook_responses_5xx_total " << metrics.responses5xx.load(std::memory_order_relaxed) << "\n"
+        << "orderbook_rate_limited_total " << metrics.rateLimitedTotal.load(std::memory_order_relaxed) << "\n"
+        << "orderbook_auth_failures_total " << metrics.authFailuresTotal.load(std::memory_order_relaxed) << "\n"
+        << "orderbook_orders_total " << metrics.ordersTotal.load(std::memory_order_relaxed) << "\n"
+        << "orderbook_accepted_orders_total " << metrics.acceptedOrdersTotal.load(std::memory_order_relaxed) << "\n"
+        << "orderbook_cancels_total " << metrics.cancelsTotal.load(std::memory_order_relaxed) << "\n"
+        << "orderbook_accepted_cancels_total " << metrics.acceptedCancelsTotal.load(std::memory_order_relaxed) << "\n"
+        << "orderbook_trades_total " << metrics.tradesTotal.load(std::memory_order_relaxed) << "\n"
+        << "orderbook_traded_quantity_total " << metrics.tradedQuantityTotal.load(std::memory_order_relaxed) << "\n"
+        << "orderbook_simulator_ticks_total " << metrics.simulatorTicksTotal.load(std::memory_order_relaxed) << "\n"
+        << "orderbook_admin_actions_total " << metrics.adminActionsTotal.load(std::memory_order_relaxed) << "\n"
+        << "# TYPE orderbook_rooms gauge\n"
+        << "orderbook_rooms " << rooms.rooms().size() << "\n"
+        << "orderbook_lobbies " << rooms.lobbies().size() << "\n"
+        << "orderbook_active_sessions " << rooms.activeSessionCount() << "\n"
+        << "orderbook_single_sessions " << rooms.singleSessionCount() << "\n"
+        << "orderbook_persistence_enabled " << (persistence.enabled() ? 1 : 0) << "\n";
+    return out.str();
+}
+
+std::string serializeReady(const PersistenceStore& persistence) {
+    const AuthConfig& auth = authConfig();
+    std::ostringstream out;
+    out << "{"
+        << "\"ok\":true,"
+        << "\"persistenceEnabled\":" << (persistence.enabled() ? "true" : "false") << ","
+        << "\"clerkJwtVerification\":" << (!auth.jwtPublicKeyPem.empty() && !auth.allowUnverifiedJwt ? "true" : "false") << ","
+        << "\"unverifiedJwtEnabled\":" << (auth.allowUnverifiedJwt ? "true" : "false") << ","
+        << "\"botKeyCount\":" << auth.botCredentials.size() << ","
+        << "\"adminConfigured\":" << (!auth.adminToken.empty() ? "true" : "false")
+        << "}";
+    return out.str();
+}
+
+std::string serializeAdminSummary(const RoomStore& rooms, const PersistenceStore& persistence, const MetricsStore& metrics) {
+    std::ostringstream out;
+    out << "{"
+        << "\"rooms\":" << rooms.rooms().size() << ","
+        << "\"lobbies\":" << rooms.lobbies().size() << ","
+        << "\"activeSessions\":" << rooms.activeSessionCount() << ","
+        << "\"singleSessions\":" << rooms.singleSessionCount() << ","
+        << "\"persistenceEnabled\":" << (persistence.enabled() ? "true" : "false") << ","
+        << "\"requestsTotal\":" << metrics.requestsTotal.load(std::memory_order_relaxed) << ","
+        << "\"ordersTotal\":" << metrics.ordersTotal.load(std::memory_order_relaxed) << ","
+        << "\"tradesTotal\":" << metrics.tradesTotal.load(std::memory_order_relaxed) << ","
+        << "\"rateLimitedTotal\":" << metrics.rateLimitedTotal.load(std::memory_order_relaxed)
+        << "}";
+    return out.str();
+}
 
 void rejectClientOrderId(const std::string& body) {
     if (jsonIntField(body, "orderId")) {
@@ -2868,6 +3277,17 @@ std::size_t parseLimit(const std::string& query, std::size_t defaultLimit = 25, 
     return std::max<std::size_t>(1, std::min(limit, maxLimit));
 }
 
+std::uint64_t parseSince(const std::string& query) {
+    const std::regex pattern("(^|&)since=([0-9]+)(&|$)");
+    std::smatch match;
+
+    if (!std::regex_search(query, match, pattern)) {
+        return 0;
+    }
+
+    return static_cast<std::uint64_t>(std::stoull(match[2].str()));
+}
+
 std::optional<std::string> symbolFromPrefixedPath(const std::string& path, const std::string& prefix) {
     if (path.rfind(prefix, 0) != 0 || path.size() <= prefix.size()) {
         return std::nullopt;
@@ -2908,6 +3328,19 @@ std::optional<ParsedLobbyPath> parseLobbyPath(const std::string& path) {
 
 HttpResponse jsonResponse(int status, const std::string& body) {
     return {status, "application/json", body};
+}
+
+HttpResponse textResponse(int status, const std::string& body, const std::string& contentType = "text/plain") {
+    return {status, contentType, body};
+}
+
+HttpResponse liveUpdateResponse(LiveUpdateHub& updates, const std::string& scopeKey, const std::string& query) {
+    const std::uint64_t since = parseSince(query);
+    const LiveUpdate update = updates.waitFor(
+        scopeKey,
+        since,
+        std::chrono::milliseconds(serverConfig().liveWaitMilliseconds));
+    return jsonResponse(200, serializeLiveUpdate(update, since));
 }
 
 bool hasSymbol(const Exchange& exchange, const std::string& symbol) {
@@ -2996,6 +3429,8 @@ PortfolioRecord portfolioWithReservations(const GameRoom& room, TraderId traderI
 HttpResponse orderResultResponse(
     AccountStore& accounts,
     PersistenceStore& persistence,
+    MetricsStore& metrics,
+    LiveUpdateHub& updates,
     const std::string& sessionId,
     const std::string& roomId,
     RoomMode roomMode,
@@ -3008,6 +3443,8 @@ HttpResponse orderResultResponse(
     accounts.recordTrades(symbol, result);
     persistence.recordOrder(sessionId, roomId, roomMode, traderId, side, mode, order, result);
     persistence.recordTrades(sessionId, symbol, result);
+    metrics.recordOrderResult(result);
+    updates.publish(sessionScopeKey(roomMode, sessionId), "order", symbol);
     return jsonResponse(200, serializeSubmitResult(result));
 }
 
@@ -3055,16 +3492,18 @@ HttpResponse handleGetMe(
 HttpResponse handlePostOrder(
     GameRoom& room,
     PersistenceStore& persistence,
+    MetricsStore& metrics,
+    LiveUpdateHub& updates,
     const std::string& sessionId,
     const std::string& path,
     const HttpRequest& request) {
-    Exchange& exchange = room.exchange;
-    AccountStore& accounts = room.accounts;
-    OrderIdGenerator& orderIds = room.orderIds;
-
     try {
         const TraderId traderId = authenticatedTraderId(request);
         const std::string& body = request.body;
+        std::lock_guard<std::mutex> marketLock(room.marketMutex);
+        Exchange& exchange = room.exchange;
+        AccountStore& accounts = room.accounts;
+        OrderIdGenerator& orderIds = room.orderIds;
 
         if (path == "/orders/buy") {
             ParsedOrder order = parseNewOrderWithPrice(body);
@@ -3073,6 +3512,8 @@ HttpResponse handlePostOrder(
             return orderResultResponse(
                 accounts,
                 persistence,
+                metrics,
+                updates,
                 sessionId,
                 room.id,
                 room.mode,
@@ -3091,6 +3532,8 @@ HttpResponse handlePostOrder(
             return orderResultResponse(
                 accounts,
                 persistence,
+                metrics,
+                updates,
                 sessionId,
                 room.id,
                 room.mode,
@@ -3109,6 +3552,8 @@ HttpResponse handlePostOrder(
             return orderResultResponse(
                 accounts,
                 persistence,
+                metrics,
+                updates,
                 sessionId,
                 room.id,
                 room.mode,
@@ -3127,6 +3572,8 @@ HttpResponse handlePostOrder(
             return orderResultResponse(
                 accounts,
                 persistence,
+                metrics,
+                updates,
                 sessionId,
                 room.id,
                 room.mode,
@@ -3145,6 +3592,8 @@ HttpResponse handlePostOrder(
             return orderResultResponse(
                 accounts,
                 persistence,
+                metrics,
+                updates,
                 sessionId,
                 room.id,
                 room.mode,
@@ -3163,6 +3612,8 @@ HttpResponse handlePostOrder(
             return orderResultResponse(
                 accounts,
                 persistence,
+                metrics,
+                updates,
                 sessionId,
                 room.id,
                 room.mode,
@@ -3181,6 +3632,8 @@ HttpResponse handlePostOrder(
             return orderResultResponse(
                 accounts,
                 persistence,
+                metrics,
+                updates,
                 sessionId,
                 room.id,
                 room.mode,
@@ -3199,6 +3652,8 @@ HttpResponse handlePostOrder(
             return orderResultResponse(
                 accounts,
                 persistence,
+                metrics,
+                updates,
                 sessionId,
                 room.id,
                 room.mode,
@@ -3216,6 +3671,8 @@ HttpResponse handlePostOrder(
             return orderResultResponse(
                 accounts,
                 persistence,
+                metrics,
+                updates,
                 sessionId,
                 room.id,
                 room.mode,
@@ -3233,6 +3690,8 @@ HttpResponse handlePostOrder(
             return orderResultResponse(
                 accounts,
                 persistence,
+                metrics,
+                updates,
                 sessionId,
                 room.id,
                 room.mode,
@@ -3254,6 +3713,8 @@ HttpResponse handlePostOrder(
 
             const bool canceled = exchange.cancelForTrader(*symbol, traderId, *orderId);
             persistence.recordCancel(sessionId, room.id, room.mode, traderId, *symbol, *orderId, canceled);
+            metrics.recordCancel(canceled);
+            updates.publish(sessionScopeKey(room.mode, sessionId), "cancel", *symbol);
             return jsonResponse(200, std::string("{\"canceled\":") + (canceled ? "true" : "false") + "}");
         }
     } catch (const AuthError& ex) {
@@ -3268,6 +3729,8 @@ HttpResponse handlePostOrder(
 HttpResponse routeRoom(
     GameRoom& room,
     PersistenceStore& persistence,
+    MetricsStore& metrics,
+    LiveUpdateHub& updates,
     const std::string& sessionId,
     const HttpRequest& request) {
     const auto [path, query] = splitQuery(request.path);
@@ -3281,6 +3744,10 @@ HttpResponse routeRoom(
     if (request.method == "GET") {
         if (path == "/health") {
             return jsonResponse(200, "{\"ok\":true}");
+        }
+
+        if (path == "/events") {
+            return liveUpdateResponse(updates, sessionScopeKey(room.mode, sessionId), query);
         }
 
         if (path == "/symbols") {
@@ -3315,7 +3782,7 @@ HttpResponse routeRoom(
     }
 
     if (request.method == "POST") {
-        return handlePostOrder(room, persistence, sessionId, path, request);
+        return handlePostOrder(room, persistence, metrics, updates, sessionId, path, request);
     }
 
     return jsonResponse(405, jsonError("only GET, POST, and OPTIONS are supported"));
@@ -3334,6 +3801,8 @@ HttpResponse routeLobby(
     RoomStore& rooms,
     CompetitiveLobby& lobby,
     PersistenceStore& persistence,
+    MetricsStore& metrics,
+    LiveUpdateHub& updates,
     const HttpRequest& request) {
     const auto [path, query] = splitQuery(request.path);
 
@@ -3361,10 +3830,14 @@ HttpResponse routeLobby(
         if (request.method == "POST" && path == "/join") {
             const AuthenticatedUser user = authenticatedUser(request);
             persistence.upsertUser(user);
-            const ParticipantTrack track = parseParticipantTrack(jsonStringField(request.body, "track").value_or("manual"));
+            const ParticipantTrack track = user.bot
+                ? ParticipantTrack::Bot
+                : parseParticipantTrack(jsonStringField(request.body, "track").value_or("manual"));
             const LobbyJoinOutcome outcome = rooms.joinCompetitiveLobby(lobby.id, user.traderId, track);
             if (outcome.result == LobbyJoinResult::Joined) {
                 persistence.recordSessionEvent(lobby.id, lobby.roomId, RoomMode::Competitive, user.traderId, track, "join");
+                updates.publish("public:lobbies", "join");
+                updates.publish(sessionScopeKey(RoomMode::Competitive, lobby.id), "join");
             }
 
             const int status = (outcome.result == LobbyJoinResult::Joined || outcome.result == LobbyJoinResult::AlreadyJoined)
@@ -3390,6 +3863,8 @@ HttpResponse routeLobby(
                     track,
                     "leave",
                     Clock::now() + std::chrono::seconds(rooms.config().rejoinCooldownSeconds));
+                updates.publish("public:lobbies", "leave");
+                updates.publish(sessionScopeKey(RoomMode::Competitive, lobby.id), "leave");
             }
 
             return jsonResponse(
@@ -3438,10 +3913,15 @@ HttpResponse routeLobby(
 
     HttpRequest scopedRequest = request;
     scopedRequest.path = path + (query.empty() ? "" : "?" + query);
-    return routeRoom(*lobby.game, persistence, lobby.id, scopedRequest);
+    return routeRoom(*lobby.game, persistence, metrics, updates, lobby.id, scopedRequest);
 }
 
-HttpResponse route(RoomStore& rooms, PersistenceStore& persistence, const HttpRequest& request) {
+HttpResponse route(
+    RoomStore& rooms,
+    PersistenceStore& persistence,
+    MetricsStore& metrics,
+    LiveUpdateHub& updates,
+    const HttpRequest& request) {
     const auto [path, query] = splitQuery(request.path);
 
     if (request.method == "OPTIONS") {
@@ -3451,6 +3931,24 @@ HttpResponse route(RoomStore& rooms, PersistenceStore& persistence, const HttpRe
     if (request.method == "GET") {
         if (path == "/health") {
             return jsonResponse(200, "{\"ok\":true}");
+        }
+
+        if (path == "/ready") {
+            return jsonResponse(200, serializeReady(persistence));
+        }
+
+        if (path == "/metrics") {
+            return textResponse(200, serializeMetrics(metrics, rooms, persistence));
+        }
+
+        if (path == "/admin/summary") {
+            try {
+                requireAdmin(request);
+                metrics.recordAdminAction();
+                return jsonResponse(200, serializeAdminSummary(rooms, persistence, metrics));
+            } catch (const AuthError& ex) {
+                return jsonResponse(401, jsonError(ex.what()));
+            }
         }
 
         if (path == "/rooms") {
@@ -3529,6 +4027,7 @@ HttpResponse route(RoomStore& rooms, PersistenceStore& persistence, const HttpRe
                 if (outcome.result == LobbyJoinResult::Joined) {
                     const std::string sessionId = room->id + "-" + std::to_string(user.traderId);
                     persistence.recordSessionEvent(sessionId, room->id, RoomMode::Single, user.traderId, ParticipantTrack::Manual, "join");
+                    updates.publish(sessionScopeKey(RoomMode::Single, sessionId), "join");
                 }
 
                 const int status = (outcome.result == LobbyJoinResult::Joined || outcome.result == LobbyJoinResult::AlreadyJoined)
@@ -3557,6 +4056,7 @@ HttpResponse route(RoomStore& rooms, PersistenceStore& persistence, const HttpRe
                         ParticipantTrack::Manual,
                         "leave",
                         Clock::now() + std::chrono::seconds(rooms.config().rejoinCooldownSeconds));
+                    updates.publish(sessionScopeKey(RoomMode::Single, sessionId), "leave");
                 }
 
                 return jsonResponse(
@@ -3588,14 +4088,20 @@ HttpResponse route(RoomStore& rooms, PersistenceStore& persistence, const HttpRe
                 const int steps = static_cast<int>(std::max<std::int64_t>(
                     1,
                     std::min<std::int64_t>(jsonIntField(request.body, "steps").value_or(1), 25)));
-                const SimulatorTickResult result = advanceSinglePlayerSimulator(*session->game, steps);
+                SimulatorTickResult result;
+                {
+                    std::lock_guard<std::mutex> marketLock(session->game->marketMutex);
+                    result = advanceSinglePlayerSimulator(*session->game, steps);
+                }
                 persistence.recordSimulatorTick(session->id, room->id, user.traderId, result.steps);
+                metrics.recordSimulatorTick(result.steps);
+                updates.publish(sessionScopeKey(RoomMode::Single, session->id), "simulator");
                 return jsonResponse(200, serializeSimulatorTickResult(result));
             }
 
             HttpRequest scopedRequest = request;
             scopedRequest.path = roomPath->nestedPath + (query.empty() ? "" : "?" + query);
-            return routeRoom(*session->game, persistence, session->id, scopedRequest);
+            return routeRoom(*session->game, persistence, metrics, updates, session->id, scopedRequest);
         } catch (const AuthError& ex) {
             return jsonResponse(401, jsonError(ex.what()));
         } catch (const std::exception& ex) {
@@ -3620,7 +4126,45 @@ HttpResponse route(RoomStore& rooms, PersistenceStore& persistence, const HttpRe
 
         HttpRequest scopedRequest = request;
         scopedRequest.path = lobbyPath->nestedPath + (query.empty() ? "" : "?" + query);
-        return routeLobby(rooms, *lobby, persistence, scopedRequest);
+        return routeLobby(rooms, *lobby, persistence, metrics, updates, scopedRequest);
+    }
+
+    const std::string adminLobbyPrefix = "/admin/lobbies/";
+    if (path.rfind(adminLobbyPrefix, 0) == 0) {
+        const std::string remainder = path.substr(adminLobbyPrefix.size());
+        const std::size_t slash = remainder.find('/');
+        const std::string lobbyId = slash == std::string::npos ? remainder : remainder.substr(0, slash);
+        const std::string adminPath = slash == std::string::npos ? "" : remainder.substr(slash);
+
+        if (request.method == "POST" && adminPath == "/finish") {
+            try {
+                requireAdmin(request);
+                CompetitiveLobby* lobby = rooms.findLobby(urlDecode(lobbyId));
+                if (lobby == nullptr) {
+                    return jsonResponse(404, jsonError("unknown lobby"));
+                }
+
+                lobby->forceFinish();
+                lobby->finalizeIfNeeded(rooms.ratings(ParticipantTrack::Manual), rooms.ratings(ParticipantTrack::Bot));
+                if (lobby->hasFinalRatings() && rooms.storeLeaderboardRatings(*lobby)) {
+                    for (const LeaderboardRow& row : lobby->leaderboardRows()) {
+                        persistence.recordRating(lobby->id, row);
+                    }
+                }
+
+                metrics.recordAdminAction();
+                updates.publish("public:lobbies", "admin-finish");
+                updates.publish(sessionScopeKey(RoomMode::Competitive, lobby->id), "admin-finish");
+                return jsonResponse(
+                    200,
+                    std::string("{\"finished\":true,\"lobby\":") + serializeLobby(*lobby)
+                        + ",\"leaderboard\":" + serializeLeaderboard(lobby->leaderboardRows()).substr(std::string("{\"leaderboard\":").size()));
+            } catch (const AuthError& ex) {
+                return jsonResponse(401, jsonError(ex.what()));
+            } catch (const std::exception& ex) {
+                return jsonResponse(400, jsonError(ex.what()));
+            }
+        }
     }
 
     (void)rooms;
@@ -3706,14 +4250,90 @@ void sendResponse(SocketHandle client, const HttpResponse& response) {
         << "Content-Type: " << response.contentType << "\r\n"
         << "Access-Control-Allow-Origin: *\r\n"
         << "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
-        << "Access-Control-Allow-Headers: Content-Type, Authorization\r\n"
+        << "Access-Control-Allow-Headers: Content-Type, Authorization, X-Admin-Token\r\n"
         << "Content-Length: " << response.body.size() << "\r\n"
         << "Connection: close\r\n"
         << "\r\n"
         << response.body;
 
     const std::string payload = out.str();
-    send(client, payload.c_str(), static_cast<int>(payload.size()), 0);
+    std::size_t sent = 0;
+    while (sent < payload.size()) {
+        const int chunk = send(
+            client,
+            payload.c_str() + sent,
+            static_cast<int>(payload.size() - sent),
+            0);
+        if (chunk <= 0) {
+            break;
+        }
+
+        sent += static_cast<std::size_t>(chunk);
+    }
+
+#ifdef _WIN32
+    shutdown(client, SD_SEND);
+#else
+    shutdown(client, SHUT_WR);
+#endif
+}
+
+std::string ipString(const sockaddr_in& address) {
+    char buffer[INET_ADDRSTRLEN] = {};
+    const char* result = inet_ntop(AF_INET, &address.sin_addr, buffer, sizeof(buffer));
+    return result == nullptr ? "unknown" : std::string(result);
+}
+
+HttpResponse rateLimitResponse(const RateLimitDecision& decision) {
+    return jsonResponse(
+        429,
+        std::string("{\"error\":\"rate limit exceeded\",\"limit\":") + std::to_string(decision.limit)
+            + ",\"retryAfterSeconds\":" + std::to_string(decision.retryAfterSeconds) + "}");
+}
+
+void handleClient(
+    SocketHandle client,
+    sockaddr_in clientAddress,
+    RoomStore& rooms,
+    PersistenceStore& persistence,
+    MetricsStore& metrics,
+    RateLimiter& rateLimiter,
+    LiveUpdateHub& updates,
+    const ServerConfig& config) {
+    try {
+        std::optional<HttpRequest> request = readRequest(client);
+        if (!request) {
+            sendResponse(client, jsonResponse(400, jsonError("could not parse request")));
+            closeSocket(client);
+            return;
+        }
+
+        request->clientIp = ipString(clientAddress);
+        metrics.recordRequest();
+
+        const RateLimitDecision limit = enforceRateLimit(*request, rateLimiter, config);
+        if (!limit.allowed) {
+            metrics.recordRateLimited();
+            HttpResponse response = rateLimitResponse(limit);
+            metrics.recordResponse(response.status);
+            sendResponse(client, response);
+            closeSocket(client);
+            return;
+        }
+
+        HttpResponse response = route(rooms, persistence, metrics, updates, *request);
+        if (response.status == 401) {
+            metrics.recordAuthFailure();
+        }
+        metrics.recordResponse(response.status);
+        sendResponse(client, response);
+    } catch (const std::exception& ex) {
+        HttpResponse response = jsonResponse(500, jsonError(ex.what()));
+        metrics.recordResponse(response.status);
+        sendResponse(client, response);
+    }
+
+    closeSocket(client);
 }
 
 SocketHandle createServerSocket(int port) {
@@ -4299,6 +4919,22 @@ std::int64_t RoomStore::cooldownRemainingSeconds(TraderId traderId) const {
     return secondsRemaining(cooldown->second);
 }
 
+std::size_t RoomStore::activeSessionCount() const {
+    std::lock_guard<std::mutex> lock(sessionMutex);
+    return activeByTrader.size();
+}
+
+std::size_t RoomStore::singleSessionCount() const {
+    std::lock_guard<std::mutex> lock(sessionMutex);
+    std::size_t total = 0;
+    for (const auto& [roomId, sessions] : singleSessionsByRoom) {
+        (void)roomId;
+        total += sessions.size();
+    }
+
+    return total;
+}
+
 const GameConfig& RoomStore::config() const {
     return gameConfig;
 }
@@ -4501,9 +5137,13 @@ int main(int argc, char** argv) {
         SocketRuntime runtime;
         SocketHandle server = createServerSocket(port);
         GameConfig config = GameConfig::fromEnvironment();
+        const ServerConfig& operationalConfig = serverConfig();
         const AuthConfig& auth = authConfig();
         PersistenceStore persistence;
         RoomStore rooms(config);
+        MetricsStore metrics;
+        RateLimiter rateLimiter;
+        LiveUpdateHub updates;
         rooms.ratings(ParticipantTrack::Manual) = persistence.loadRatings(ParticipantTrack::Manual);
         rooms.ratings(ParticipantTrack::Bot) = persistence.loadRatings(ParticipantTrack::Bot);
         const RestoreStats restoreStats = restoreFromEvents(rooms, persistence.loadReplayEvents());
@@ -4513,6 +5153,9 @@ int main(int argc, char** argv) {
                   << ", competitive start delay: " << config.startDelaySeconds
                   << "s, game duration: " << config.gameDurationSeconds
                   << "s, rejoin cooldown: " << config.rejoinCooldownSeconds << "s\n";
+        std::cout << "Rate limits: " << operationalConfig.requestRateLimitPerMinute
+                  << " requests/min, " << operationalConfig.mutationRateLimitPerMinute
+                  << " mutations/min, live wait " << operationalConfig.liveWaitMilliseconds << "ms\n";
         if (auth.allowUnverifiedJwt) {
             std::cerr << "WARNING: ORDERBOOK_ALLOW_UNVERIFIED_JWT is enabled. "
                       << "Use only for local prototype tests.\n";
@@ -4520,6 +5163,12 @@ int main(int argc, char** argv) {
             std::cerr << "Auth: CLERK_JWT_KEY is not set; authenticated endpoints will reject requests.\n";
         } else {
             std::cout << "Auth: Clerk JWT signature verification enabled.\n";
+        }
+        if (!auth.botCredentials.empty()) {
+            std::cout << "Auth: " << auth.botCredentials.size() << " bot API key(s) configured.\n";
+        }
+        if (!auth.adminToken.empty()) {
+            std::cout << "Admin: token-protected endpoints enabled.\n";
         }
         if (persistence.enabled()) {
             std::cout << "Replayed " << restoreStats.events << " persisted events ("
@@ -4539,14 +5188,17 @@ int main(int argc, char** argv) {
                 continue;
             }
 
-            std::optional<HttpRequest> request = readRequest(client);
-            if (request) {
-                sendResponse(client, route(rooms, persistence, *request));
-            } else {
-                sendResponse(client, jsonResponse(400, jsonError("could not parse request")));
-            }
-
-            closeSocket(client);
+            std::thread(
+                handleClient,
+                client,
+                clientAddress,
+                std::ref(rooms),
+                std::ref(persistence),
+                std::ref(metrics),
+                std::ref(rateLimiter),
+                std::ref(updates),
+                std::cref(operationalConfig))
+                .detach();
         }
 
         closeSocket(server);

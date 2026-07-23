@@ -1,5 +1,5 @@
 param(
-    [int]$Port = 18091
+    [int]$Port = 18121
 )
 
 $ErrorActionPreference = "Stop"
@@ -87,6 +87,8 @@ $publicKey = Join-Path $script:tempRoot "public.pem"
 $previousJwtKey = $env:CLERK_JWT_KEY
 $previousIssuer = $env:CLERK_ISSUER
 $previousAllowUnverified = $env:ORDERBOOK_ALLOW_UNVERIFIED_JWT
+$previousRateLimit = $env:ORDERBOOK_RATE_LIMIT_PER_MINUTE
+$previousMutationRateLimit = $env:ORDERBOOK_MUTATION_RATE_LIMIT_PER_MINUTE
 $apiProcess = $null
 
 try {
@@ -98,6 +100,8 @@ try {
     $env:CLERK_JWT_KEY = Get-Content -LiteralPath $publicKey -Raw
     $env:CLERK_ISSUER = $issuer
     $env:ORDERBOOK_ALLOW_UNVERIFIED_JWT = $null
+    $env:ORDERBOOK_RATE_LIMIT_PER_MINUTE = "500"
+    $env:ORDERBOOK_MUTATION_RATE_LIMIT_PER_MINUTE = "500"
 
     $apiProcess = Start-Process -FilePath $apiBinary -ArgumentList $Port -WindowStyle Hidden -PassThru
     Start-Sleep -Milliseconds 500
@@ -140,6 +144,8 @@ try {
     $env:CLERK_JWT_KEY = $previousJwtKey
     $env:CLERK_ISSUER = $previousIssuer
     $env:ORDERBOOK_ALLOW_UNVERIFIED_JWT = $previousAllowUnverified
+    $env:ORDERBOOK_RATE_LIMIT_PER_MINUTE = $previousRateLimit
+    $env:ORDERBOOK_MUTATION_RATE_LIMIT_PER_MINUTE = $previousMutationRateLimit
 
     if (Test-Path -LiteralPath $script:tempRoot) {
         $resolvedTempRoot = Resolve-Path -LiteralPath $script:tempRoot

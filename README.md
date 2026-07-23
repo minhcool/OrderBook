@@ -27,6 +27,11 @@ The project currently provides an in-memory orderbook library with:
 - starting cash, available cash, reserved cash, and no-short/no-overspend checks
 - manual and bot tracks with chess-style Elo updates at game end
 - bot-facing HTTP workflow using the same room/lobby APIs
+- bot API keys through `ORDERBOOK_BOT_KEYS`
+- authenticated long-poll live update cursors for rooms/lobbies
+- request and mutation rate limiting
+- token-protected admin summary and lobby-finish controls
+- readiness and Prometheus-style metrics endpoints
 - a small standard-library Python example bot
 - optional PostgreSQL event/history persistence through `DATABASE_URL`
 - startup restore from a replayable PostgreSQL event log
@@ -175,7 +180,7 @@ For bot clients, see [docs/BOT_API.md](docs/BOT_API.md).
 
 - No CLI yet.
 - Local HTTP API exists for testing, but it is not production-grade.
-- No WebSocket/FIX API yet; live updates currently use polling.
+- No WebSocket/FIX API yet; live updates currently use authenticated long-polling.
 - Website uses Clerk login, but roles are not implemented yet.
 - Local fake-token auth requires explicitly setting `ORDERBOOK_ALLOW_UNVERIFIED_JWT=1`.
 - PostgreSQL restore replays the ordered event log from the beginning; checkpoint rows are watermarks, not full snapshot fast-forward restore yet.
@@ -184,7 +189,7 @@ For bot clients, see [docs/BOT_API.md](docs/BOT_API.md).
 - Portfolio values are estimates from starting cash, fill cash flow, reserved cash, and in-memory last-trade marks.
 - Competitive lobbies are currently seeded at startup; dynamic lobby creation and matchmaking are not implemented yet.
 - No news engine or bot tournament scheduler yet.
-- Bots currently use Clerk session tokens; API-key auth is not implemented yet.
+- Bot API keys are configured by env var, not self-service user-generated keys yet.
 - Masked-real-series assets are only metadata placeholders until a licensed historical data import exists.
 - No tick size or lot size validation.
 - Cancel and replace still scan the book instead of using an order ID index.

@@ -6,6 +6,7 @@ import type {
   JoinResult,
   LeaderboardRow,
   LeaveResult,
+  LiveUpdate,
   LobbyMembership,
   MarketScope,
   MarketPrice,
@@ -151,6 +152,17 @@ export async function fetchBook(apiBase: string, scope: MarketScope | undefined,
 
 export async function fetchPrice(apiBase: string, scope: MarketScope | undefined, symbol: string): Promise<MarketPrice> {
   return requestJson(`${scopedBase(apiBase, scope)}/prices/${encodeURIComponent(symbol)}`);
+}
+
+export async function waitForLiveUpdate(
+  apiBase: string,
+  scope: MarketScope | undefined,
+  token: string,
+  since: number
+): Promise<LiveUpdate> {
+  return requestJson(`${scopedBase(apiBase, scope)}/events?since=${since}`, {
+    headers: authHeaders(token)
+  });
 }
 
 export async function fetchMarketTrades(

@@ -39,9 +39,11 @@ Stop it with `Ctrl+C`.
 - Price marks are based on the room/lobby trade tape. The current portfolio mark uses the last trade price; `/prices` also exposes VWAPs over the last 3, 5, and 10 trades.
 - Request bodies are flat JSON objects.
 - The parser is intentionally tiny and only supports the fields shown here.
-- POST order endpoints and `/me` endpoints require `Authorization: Bearer <Clerk session token>`.
+- POST order endpoints and `/me` endpoints require `Authorization: Bearer <Clerk session token>` or a configured bot API key.
 - Missing or malformed bearer tokens return `401`.
 - The C++ server verifies Clerk JWT signatures with `CLERK_JWT_KEY`, then derives `TraderId` from the verified `sub` claim. Set `ORDERBOOK_ALLOW_UNVERIFIED_JWT=1` only for local prototype tests.
+- Bot API keys map to stable `bot:{name}` subjects and are forced onto the bot track in competitive lobbies.
+- Rate limits return `429` with `retryAfterSeconds`.
 
 ## Auth Environment
 
@@ -62,9 +64,16 @@ CLERK_ISSUER=https://your-clerk-issuer
 CLERK_AUDIENCE=api-audience-one,api-audience-two
 CLERK_AUTHORIZED_PARTIES=https://your-vercel-app.vercel.app,https://your-domain.com
 ORDERBOOK_AUTH_CLOCK_SKEW_SECONDS=60
+ORDERBOOK_BOT_KEYS=maker-bot:long_random_secret,trend-bot:another_secret
+ORDERBOOK_ADMIN_TOKEN=long_random_admin_secret
+ORDERBOOK_RATE_LIMIT_PER_MINUTE=240
+ORDERBOOK_MUTATION_RATE_LIMIT_PER_MINUTE=80
+ORDERBOOK_LIVE_WAIT_MS=2500
 ```
 
 `CLERK_ISSUER` checks `iss`, `CLERK_AUDIENCE` checks `aud`, and `CLERK_AUTHORIZED_PARTIES` checks Clerk's `azp` claim.
+
+`ORDERBOOK_BOT_KEYS` is a comma-separated list of `name:token` entries. A bot sends the token as `Authorization: Bearer <token>`. `ORDERBOOK_ADMIN_TOKEN` is accepted through `X-Admin-Token: <token>` or `Authorization: Bearer <token>` for admin endpoints only.
 
 ## GET Endpoints
 
@@ -72,6 +81,8 @@ Health:
 
 ```http
 GET /health
+GET /ready
+GET /metrics
 ```
 
 Response:
@@ -79,6 +90,18 @@ Response:
 ```json
 { "ok": true }
 ```
+
+`/ready` returns JSON with persistence/auth/bot/admin readiness. `/metrics` returns Prometheus-style plaintext counters and gauges.
+
+Admin:
+
+```http
+GET  /admin/summary
+POST /admin/lobbies/{lobbyId}/finish
+X-Admin-Token: <ORDERBOOK_ADMIN_TOKEN>
+```
+
+Admin endpoints return `401` unless `ORDERBOOK_ADMIN_TOKEN` is configured and supplied. `finish` immediately closes a competitive lobby, finalizes Elo/PnL rows, and publishes a live update.
 
 Rooms:
 
@@ -154,7 +177,7 @@ Response:
 }
 ```
 
-Joining and leaving require a Clerk bearer token:
+Joining and leaving require a bearer token:
 
 ```http
 GET  /lobbies/{lobbyId}/membership
@@ -172,6 +195,8 @@ Lobby join accepts an optional body:
 ```
 
 Bots should send `{ "track": "bot" }` so their Elo stays separate from manual users.
+
+Bots authenticated with `ORDERBOOK_BOT_KEYS` are forced to the bot track even if the body says `"manual"`.
 
 Leaderboard rows are available after a competitive lobby finishes. PnL is based on final estimated portfolio value versus starting cash. Manual users and bots are rated separately with a chess-style Elo update:
 
@@ -283,6 +308,29 @@ Response:
   ]
 }
 ```
+
+Live update cursor:
+
+```http
+GET /rooms/{roomId}/events?since=0
+GET /lobbies/{lobbyId}/events?since=0
+Authorization: Bearer <Clerk session token or bot API key>
+```
+
+This is an authenticated long-poll endpoint for an entered room/lobby. It waits up to `ORDERBOOK_LIVE_WAIT_MS` for a new room/lobby event, then returns either a changed event or a heartbeat:
+
+```json
+{
+  "sequence": 12,
+  "changed": true,
+  "scope": "lobby:aurora-open-10",
+  "type": "order",
+  "symbol": "AXON",
+  "createdAt": 1784772000
+}
+```
+
+Send the latest `sequence` back as `since` on the next request. Event `type` may be `join`, `leave`, `order`, `cancel`, `simulator`, `admin-finish`, or `heartbeat`.
 
 Book snapshot:
 

@@ -6,7 +6,7 @@ Users can pick a room/lobby, enter that session, choose an asset, and trade agai
 
 Authentication is handled by Clerk. Signed-in users can enter exactly one active session, then submit, replace, and cancel orders. Leaving cancels resting orders and starts a short cooldown before re-entering.
 
-Live updates are enabled by default. The website polls the API while the user is inside a session; in single-player mode, each live poll also advances the user's personal simulator by one tick. The session panel shows room choice, lobby capacity, phase/timer state, the active session lock, and the manual/bot track selector for competitive lobbies.
+Live updates are enabled by default. Competitive sessions use the authenticated `/events?since=` long-poll endpoint to wake the UI when the server publishes room/lobby changes. In single-player mode, each live loop also advances the user's personal simulator by one tick. The session panel shows room choice, lobby capacity, phase/timer state, the active session lock, and the manual/bot track selector for competitive lobbies.
 
 New order IDs are assigned by the API server. The website shows returned IDs in activity and uses them for replace/cancel actions.
 
@@ -102,6 +102,13 @@ POST /lobbies/{lobbyId}/leave
 ```
 
 After joining, books, orders, fills, and portfolio requests use `/lobbies/{lobbyId}/...`. The lobby selector displays current participants and capacity. Leaving cancels the user's resting orders in that lobby.
+
+Live refresh uses:
+
+```text
+GET /rooms/{roomId}/events?since={sequence}
+GET /lobbies/{lobbyId}/events?since={sequence}
+```
 
 Competitive lobbies have `waiting`, `starting`, `running`, and `finished` phases. The website shows the timer and disables order entry until the selected lobby is `running`.
 

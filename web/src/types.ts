@@ -72,6 +72,15 @@ export interface SessionSummary {
   activeSession: ActiveSession | null;
 }
 
+export interface LiveUpdate {
+  sequence: number;
+  changed: boolean;
+  scope: string;
+  type: string;
+  symbol: string;
+  createdAt: number;
+}
+
 export interface JoinResult {
   joined: boolean;
   alreadyJoined: boolean;

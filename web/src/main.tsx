@@ -38,7 +38,8 @@ import {
   leaveRoom,
   leaveLobby,
   replaceOrder,
-  submitOrder
+  submitOrder,
+  waitForLiveUpdate
 } from "./api";
 import type {
   ActiveSession,
@@ -124,6 +125,7 @@ function App() {
   const [marketTrades, setMarketTrades] = React.useState<MarketTradeRecord[]>([]);
   const [liveUpdates, setLiveUpdates] = React.useState(() => localStorage.getItem("orderbook.liveUpdates") !== "false");
   const liveRefreshInFlight = React.useRef(false);
+  const liveSequence = React.useRef(0);
 
   const [side, setSide] = React.useState<Side>("buy");
   const [mode, setMode] = React.useState<OrderMode>("limit");
@@ -343,8 +345,16 @@ function App() {
       return;
     }
 
-    const intervalId = window.setInterval(() => {
+    let canceled = false;
+    let timeoutId = 0;
+    const scope: MarketScope = {
+      roomId,
+      ...(isCompetitive ? { lobbyId } : {})
+    };
+
+    const loop = () => {
       if (liveRefreshInFlight.current) {
+        timeoutId = window.setTimeout(loop, 500);
         return;
       }
 
@@ -352,20 +362,39 @@ function App() {
       void (async () => {
         try {
           const token = await getToken();
-          if (token && !isCompetitive) {
-            await advanceSimulator(apiBase, roomId, token, 1);
+          if (!token) {
+            return;
           }
 
-          await refreshAll();
+          if (!isCompetitive) {
+            await advanceSimulator(apiBase, roomId, token, 1);
+            await refreshAll();
+          } else {
+            const update = await waitForLiveUpdate(apiBase, scope, token, liveSequence.current);
+            if (update.sequence > liveSequence.current) {
+              liveSequence.current = update.sequence;
+            }
+            await refreshAll();
+          }
         } catch {
           setApiOnline(false);
         } finally {
           liveRefreshInFlight.current = false;
+          if (!canceled) {
+            timeoutId = window.setTimeout(loop, isCompetitive ? 250 : 1500);
+          }
         }
       })();
-    }, isCompetitive ? 2500 : 1500);
+    };
 
-    return () => window.clearInterval(intervalId);
+    loop();
+    return () => {
+      canceled = true;
+      liveRefreshInFlight.current = false;
+      if (timeoutId !== 0) {
+        window.clearTimeout(timeoutId);
+      }
+    };
   }, [
     apiBase,
     getToken,
@@ -377,6 +406,10 @@ function App() {
     refreshAll,
     roomId
   ]);
+
+  React.useEffect(() => {
+    liveSequence.current = 0;
+  }, [isCompetitive, lobbyId, roomId]);
 
   async function handleSubmitOrder(event: React.FormEvent) {
     event.preventDefault();

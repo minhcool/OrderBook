@@ -33,9 +33,13 @@ if (-not (Test-Path -LiteralPath $apiBinary)) {
 $previousStartDelay = $env:ORDERBOOK_START_DELAY_SECONDS
 $previousCooldown = $env:ORDERBOOK_REJOIN_COOLDOWN_SECONDS
 $previousAllowUnverified = $env:ORDERBOOK_ALLOW_UNVERIFIED_JWT
+$previousRateLimit = $env:ORDERBOOK_RATE_LIMIT_PER_MINUTE
+$previousMutationRateLimit = $env:ORDERBOOK_MUTATION_RATE_LIMIT_PER_MINUTE
 $env:ORDERBOOK_START_DELAY_SECONDS = "1"
 $env:ORDERBOOK_REJOIN_COOLDOWN_SECONDS = "1"
 $env:ORDERBOOK_ALLOW_UNVERIFIED_JWT = "1"
+$env:ORDERBOOK_RATE_LIMIT_PER_MINUTE = "500"
+$env:ORDERBOOK_MUTATION_RATE_LIMIT_PER_MINUTE = "500"
 $apiProcess = Start-Process -FilePath $apiBinary -ArgumentList $Port -WindowStyle Hidden -PassThru
 
 try {
@@ -292,4 +296,6 @@ try {
     $env:ORDERBOOK_START_DELAY_SECONDS = $previousStartDelay
     $env:ORDERBOOK_REJOIN_COOLDOWN_SECONDS = $previousCooldown
     $env:ORDERBOOK_ALLOW_UNVERIFIED_JWT = $previousAllowUnverified
+    $env:ORDERBOOK_RATE_LIMIT_PER_MINUTE = $previousRateLimit
+    $env:ORDERBOOK_MUTATION_RATE_LIMIT_PER_MINUTE = $previousMutationRateLimit
 }

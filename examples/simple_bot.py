@@ -3,7 +3,8 @@
 
 The bot joins a single-player room by default, advances the simulator, reads the
 book and portfolio, then alternates small IOC buys/sells against displayed
-liquidity. It uses only the Python standard library.
+liquidity. Set ORDERBOOK_BOT_TOKEN to a configured bot API key for deployed
+testing. It uses only the Python standard library.
 """
 
 from __future__ import annotations

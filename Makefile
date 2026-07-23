@@ -48,6 +48,7 @@ api-build: $(API_BIN)
 api-test: $(API_BIN)
 	powershell -ExecutionPolicy Bypass -File tests/test_api_lobbies.ps1
 	powershell -ExecutionPolicy Bypass -File tests/test_api_auth.ps1
+	powershell -ExecutionPolicy Bypass -File tests/test_api_ops.ps1
 
 api: $(API_BIN)
 	$(API_BIN)

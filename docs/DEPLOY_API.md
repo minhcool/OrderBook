@@ -22,9 +22,11 @@ The included `render.yaml` uses Render's free web service plan for the prototype
 3. If Render asks for a runtime, choose Docker.
 4. Use the repo root as the service root.
 5. Add the Clerk JWT public key when Render prompts for `CLERK_JWT_KEY`.
-6. Let Render build and deploy.
-7. After deploy, copy the public service URL.
-8. In Render's Blueprint sync page, confirm both `orderbook-api` and `orderbook-db` exist.
+6. Add an `ORDERBOOK_ADMIN_TOKEN` value.
+7. Optionally add `ORDERBOOK_BOT_KEYS` if deployed bots should trade without a Clerk browser session.
+8. Let Render build and deploy.
+9. After deploy, copy the public service URL.
+10. In Render's Blueprint sync page, confirm both `orderbook-api` and `orderbook-db` exist.
 
 `CLERK_JWT_KEY` is the JWT public key from Clerk Dashboard -> API keys. It starts with:
 
@@ -40,17 +42,30 @@ Optional Render environment variables:
 CLERK_ISSUER=https://your-clerk-issuer
 CLERK_AUTHORIZED_PARTIES=https://your-vercel-app.vercel.app
 CLERK_AUDIENCE=your-api-audience
+ORDERBOOK_BOT_KEYS=maker-bot:long_random_secret,trend-bot:another_secret
+ORDERBOOK_RATE_LIMIT_PER_MINUTE=240
+ORDERBOOK_MUTATION_RATE_LIMIT_PER_MINUTE=80
+ORDERBOOK_LIVE_WAIT_MS=2500
+```
+
+Required for admin endpoints:
+
+```text
+ORDERBOOK_ADMIN_TOKEN=long_random_admin_secret
 ```
 
 The API exposes:
 
 ```text
 GET /health
+GET /ready
+GET /metrics
 GET /rooms
 GET /rooms/comp-aurora/lobbies
 POST /rooms/solo-alpha/join
 GET /rooms/solo-alpha/symbols
 POST /rooms/solo-alpha/orders/market-buy
+GET /admin/summary
 ```
 
 ## Verify
@@ -59,6 +74,7 @@ Replace the URL with your Render service URL:
 
 ```powershell
 Invoke-RestMethod https://your-orderbook-api.onrender.com/health
+Invoke-RestMethod https://your-orderbook-api.onrender.com/ready
 Invoke-RestMethod https://your-orderbook-api.onrender.com/rooms
 ```
 
@@ -69,6 +85,13 @@ Expected health response:
 ```
 
 Market data endpoints require a Clerk bearer token and an entered room/lobby. Public endpoints only expose room and lobby metadata.
+
+Admin check:
+
+```powershell
+$headers = @{ "X-Admin-Token" = "paste_ORDERBOOK_ADMIN_TOKEN_here" }
+Invoke-RestMethod https://your-orderbook-api.onrender.com/admin/summary -Headers $headers
+```
 
 ## If Render Fails
 
@@ -99,5 +122,7 @@ The website also stores the API URL in browser local storage after you click Con
 - Older history rows from before the replay-log migration are not enough to rebuild live state.
 - Render free Postgres expires after its free-tier window; use a paid database before relying on durable history.
 - Authenticated endpoints require verified Clerk JWTs unless `ORDERBOOK_ALLOW_UNVERIFIED_JWT=1` is explicitly set for local tests. Do not set that flag on Render.
+- Bot API keys and admin tokens are env-configured secrets; rotate them manually if they leak.
+- Rate limits are in-memory per API process.
 - CORS is currently open for development.
 - This is a prototype deployment path, not a production trading system.
