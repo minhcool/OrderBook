@@ -20,6 +20,8 @@ services:
         value: "60"
       - key: ORDERBOOK_STARTING_CASH
         value: "100000"
+      - key: ORDERBOOK_CHECKPOINT_EVERY_EVENTS
+        value: "100"
 
 databases:
   - name: orderbook-db

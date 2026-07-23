@@ -24,13 +24,15 @@ The project currently provides an in-memory orderbook library with:
 - starting cash, available cash, reserved cash, and no-short/no-overspend checks
 - manual and bot tracks with chess-style Elo updates at game end
 - optional PostgreSQL event/history persistence through `DATABASE_URL`
+- startup restore from a replayable PostgreSQL event log
+- checkpoint watermark records for future snapshot fast-forwarding
 - fictional room assets, including synthetic and masked-real-series profiles
 - room-scoped order books and portfolios
 - coarse-grained mutex protection
 - correctness tests
 - performance benchmarks
 
-It is not connected to a real exchange. The current API and website are development prototypes. Runtime order books are still held in memory, while PostgreSQL records users, session events, orders, cancels, trades, and ratings when `DATABASE_URL` is configured.
+It is not connected to a real exchange. The current API and website are development prototypes. Runtime order books are still held in memory while the process is running; when `DATABASE_URL` is configured, PostgreSQL records a replayable event log plus query-friendly history tables and the API rebuilds session/order/account state from that event log on startup.
 
 The game direction is:
 
@@ -155,7 +157,8 @@ For deploying the C++ API server, see [docs/DEPLOY_API.md](docs/DEPLOY_API.md).
 - No WebSocket/FIX API yet.
 - Website uses Clerk login, but roles are not implemented yet.
 - Backend JWT signature verification is not implemented yet; the current API auth bridge is for development.
-- Runtime books/account state are not rehydrated from PostgreSQL on restart yet.
+- PostgreSQL restore replays the ordered event log from the beginning; checkpoint rows are watermarks, not full snapshot fast-forward restore yet.
+- Events created before the replay-log migration remain history-only and are not enough to rebuild live state.
 - No deposits, withdrawals, margin, or settlement.
 - Portfolio values are estimates from starting cash, fill cash flow, reserved cash, and in-memory last-trade marks.
 - Competitive lobbies are currently seeded at startup; dynamic lobby creation and matchmaking are not implemented yet.

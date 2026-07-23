@@ -106,7 +106,7 @@ After entering, the market strip reads:
 GET /rooms/{roomId}/prices/{symbol}
 ```
 
-Runtime books/account state are currently in memory on the C++ API server. PostgreSQL records events/history/ratings when `DATABASE_URL` exists, but restart replay is not implemented yet.
+Runtime books/account state are currently in memory on the C++ API server. When `DATABASE_URL` exists, PostgreSQL records a replayable event log plus history tables, and the API rebuilds sessions, books, fills, positions, cooldowns, and order ID generators from that log on startup.
 
 Portfolio value is estimated from room starting cash, trade cash flow, reserved cash, and last-trade marks. It is not a real brokerage account because deposits, withdrawals, margin, and settlement are not implemented.
 

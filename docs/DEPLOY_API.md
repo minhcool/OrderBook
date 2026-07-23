@@ -13,7 +13,7 @@ render.yaml
 
 Render can build the Docker image from GitHub and run it as a public web service.
 
-The included `render.yaml` uses Render's free web service plan for the prototype and defines a Render Postgres database named `orderbook-db`. The API receives `DATABASE_URL` from that database and writes user/session/order/trade/rating history when it is available. Render free Postgres is useful for a prototype, but it has free-tier limits and expiration.
+The included `render.yaml` uses Render's free web service plan for the prototype and defines a Render Postgres database named `orderbook-db`. The API receives `DATABASE_URL` from that database, writes a replayable event log plus user/session/order/trade/rating history, and rebuilds in-memory state from the event log on startup. Render free Postgres is useful for a prototype, but it has free-tier limits and expiration.
 
 ## Steps
 
@@ -77,7 +77,9 @@ The website also stores the API URL in browser local storage after you click Con
 
 ## Important Limitations
 
-- Runtime books are still in memory. PostgreSQL stores events/history/ratings, but restart replay is not implemented yet.
+- Runtime books are still in memory while the API process is running. PostgreSQL event replay restores them after restart for events created by this replay-log version.
+- Checkpoint rows are replay watermarks right now; full state snapshot fast-forwarding is not implemented yet.
+- Older history rows from before the replay-log migration are not enough to rebuild live state.
 - Render free Postgres expires after its free-tier window; use a paid database before relying on durable history.
 - The backend reads the Clerk token subject but does not verify the JWT signature yet.
 - CORS is currently open for development.

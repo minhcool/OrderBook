@@ -25,8 +25,9 @@ Stop it with `Ctrl+C`.
 
 ## Notes
 
-- Runtime order books are in memory. PostgreSQL records users, session events, order events, trades, cancels, and ratings when `DATABASE_URL` is set.
-- Runtime books/account state are not rehydrated from PostgreSQL after restart yet.
+- Runtime order books are in memory while the process is running. PostgreSQL records a single ordered replay log plus user/session/order/trade/cancel/rating history tables when `DATABASE_URL` is set.
+- On startup, the API replays `orderbook_events` to restore sessions, lobbies, open orders, fills, cash/positions, market prices, cooldowns, and order ID generators.
+- Checkpoint rows are currently replay watermarks. Full snapshot fast-forwarding from checkpoints is not implemented yet.
 - One symbol maps to one orderbook inside one active room/lobby session.
 - Public endpoints list rooms and lobby capacity/status only. Symbols, books, prices, trades, orders, and account data require entering the selected room/lobby first.
 - Each authenticated user can have exactly one active session. Leaving cancels resting orders and starts a rejoin cooldown, 60 seconds by default.

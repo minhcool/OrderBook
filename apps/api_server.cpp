@@ -73,6 +73,10 @@ std::int64_t epochSeconds(TimePoint value) {
     return std::chrono::duration_cast<std::chrono::seconds>(value.time_since_epoch()).count();
 }
 
+[[maybe_unused]] TimePoint timeFromEpochSeconds(std::int64_t value) {
+    return TimePoint(std::chrono::seconds(value));
+}
+
 std::int64_t secondsRemaining(TimePoint deadline, TimePoint now = Clock::now()) {
     if (deadline <= now) {
         return 0;
@@ -658,6 +662,34 @@ struct ActiveSession {
     bool competitive = false;
 };
 
+struct PersistedEvent {
+    std::int64_t id = 0;
+    std::string eventType;
+    std::string sessionId;
+    std::string roomId;
+    RoomMode roomMode = RoomMode::Single;
+    TraderId traderId = 0;
+    ParticipantTrack track = ParticipantTrack::Manual;
+    std::string symbol;
+    Side side = Side::Buy;
+    std::string orderMode;
+    OrderId orderId = 0;
+    Price price = 0;
+    Qty quantity = 0;
+    bool accepted = false;
+    bool canceled = false;
+    std::optional<TimePoint> cooldownUntil;
+    TimePoint createdAt{};
+};
+
+struct RestoreStats {
+    std::size_t events = 0;
+    std::size_t sessions = 0;
+    std::size_t orders = 0;
+    std::size_t cancels = 0;
+    std::size_t skipped = 0;
+};
+
 struct CompetitiveLobby {
     std::string id;
     std::string name;
@@ -668,8 +700,11 @@ struct CompetitiveLobby {
     std::unique_ptr<GameRoom> game;
 
     LobbyJoinResult join(TraderId traderId, ParticipantTrack track) {
+        return joinAt(traderId, track, Clock::now());
+    }
+
+    LobbyJoinResult joinAt(TraderId traderId, ParticipantTrack track, TimePoint now) {
         std::lock_guard<std::mutex> lock(participantMutex);
-        const TimePoint now = Clock::now();
         updatePhaseLocked(now);
 
         if (participants.contains(traderId)) {
@@ -696,16 +731,18 @@ struct CompetitiveLobby {
     }
 
     bool leave(TraderId traderId) {
+        return leaveAt(traderId, Clock::now());
+    }
+
+    bool leaveAt(TraderId traderId, TimePoint now) {
         std::lock_guard<std::mutex> lock(participantMutex);
-        updatePhaseLocked(Clock::now());
+        updatePhaseLocked(now);
         const bool left = participants.erase(traderId) > 0;
 
         if (participants.empty() && (phase == LobbyPhase::Waiting || phase == LobbyPhase::Starting)) {
             phase = LobbyPhase::Waiting;
             startsAt.reset();
             endsAt.reset();
-        } else if (participants.empty() && phase == LobbyPhase::Running) {
-            phase = LobbyPhase::Finished;
         } else if (phase == LobbyPhase::Starting && participants.size() < static_cast<std::size_t>(minStartParticipants())) {
             phase = LobbyPhase::Waiting;
             startsAt.reset();
@@ -944,14 +981,19 @@ public:
     const GameConfig& config() const;
     std::unordered_map<TraderId, int>& ratings(ParticipantTrack track);
     bool storeLeaderboardRatings(const CompetitiveLobby& lobby);
+    bool restoreSessionJoin(const PersistedEvent& event);
+    bool restoreSessionLeave(const PersistedEvent& event);
+    GameRoom* gameForPersistedSession(const PersistedEvent& event);
 
 private:
     void addRoom(std::unique_ptr<GameRoom> room);
     void addLobby(std::unique_ptr<CompetitiveLobby> lobby);
     std::unique_ptr<GameRoom> cloneSingleRoom(const GameRoom& room) const;
+    SinglePlayerSession* ensureSingleSessionLocked(const std::string& roomId, TraderId traderId, TimePoint joinedAt);
     LobbyJoinOutcome canJoinSessionLocked(TraderId traderId, const std::string& sessionId) const;
     void markJoinedLocked(TraderId traderId, const ActiveSession& session);
     void markLeftLocked(TraderId traderId);
+    void markLeftLocked(TraderId traderId, TimePoint cooldownUntil);
 
     GameConfig gameConfig;
     mutable std::mutex sessionMutex;
@@ -1097,12 +1139,20 @@ std::string roomModeToString(RoomMode mode) {
     return mode == RoomMode::Single ? "single" : "competitive";
 }
 
+[[maybe_unused]] RoomMode parseRoomMode(const std::string& value) {
+    return lower(value) == "competitive" ? RoomMode::Competitive : RoomMode::Single;
+}
+
 std::string participantTrackToString(ParticipantTrack track) {
     return track == ParticipantTrack::Bot ? "bot" : "manual";
 }
 
 ParticipantTrack parseParticipantTrack(const std::string& value) {
     return lower(value) == "bot" ? ParticipantTrack::Bot : ParticipantTrack::Manual;
+}
+
+[[maybe_unused]] Side parseSide(const std::string& value) {
+    return lower(value) == "sell" ? Side::Sell : Side::Buy;
 }
 
 std::string lobbyPhaseToString(LobbyPhase phase) {
@@ -1810,6 +1860,10 @@ class PersistenceStore {
 public:
     PersistenceStore() {
 #ifdef ORDERBOOK_WITH_POSTGRES
+        checkpointEveryEvents = static_cast<int>(std::max<std::int64_t>(
+            1,
+            envInt64("ORDERBOOK_CHECKPOINT_EVERY_EVENTS", checkpointEveryEvents)));
+
         const char* databaseUrl = std::getenv("DATABASE_URL");
         if (databaseUrl == nullptr || databaseUrl[0] == '\0') {
             return;
@@ -1826,6 +1880,67 @@ public:
         ensureSchema();
         std::cout << "PostgreSQL persistence enabled.\n";
 #endif
+    }
+
+    std::vector<PersistedEvent> loadReplayEvents() const {
+        std::vector<PersistedEvent> events;
+#ifdef ORDERBOOK_WITH_POSTGRES
+        if (connection == nullptr) {
+            return events;
+        }
+
+        PGresult* query = PQexec(
+            connection,
+            "SELECT id, event_type, session_id, room_id, room_mode, trader_id, track, symbol, side, "
+            "order_mode, order_id, price, quantity, accepted, canceled, cooldown_until_epoch, created_at_epoch "
+            "FROM orderbook_events ORDER BY id");
+        if (PQresultStatus(query) != PGRES_TUPLES_OK) {
+            std::cerr << "PostgreSQL event replay load failed: " << PQerrorMessage(connection) << "\n";
+            PQclear(query);
+            return events;
+        }
+
+        const auto cell = [query](int row, int col) -> std::string {
+            return PQgetisnull(query, row, col) ? "" : PQgetvalue(query, row, col);
+        };
+        const auto boolCell = [&cell](int row, int col) {
+            const std::string value = lower(cell(row, col));
+            return value == "t" || value == "true" || value == "1";
+        };
+        const auto intCell = [&cell](int row, int col) -> std::int64_t {
+            const std::string value = cell(row, col);
+            return value.empty() ? 0 : std::stoll(value);
+        };
+
+        const int rows = PQntuples(query);
+        events.reserve(static_cast<std::size_t>(rows));
+        for (int row = 0; row < rows; ++row) {
+            PersistedEvent event;
+            event.id = intCell(row, 0);
+            event.eventType = cell(row, 1);
+            event.sessionId = cell(row, 2);
+            event.roomId = cell(row, 3);
+            event.roomMode = parseRoomMode(cell(row, 4));
+            event.traderId = intCell(row, 5);
+            event.track = parseParticipantTrack(cell(row, 6));
+            event.symbol = cell(row, 7);
+            event.side = parseSide(cell(row, 8));
+            event.orderMode = cell(row, 9);
+            event.orderId = intCell(row, 10);
+            event.price = intCell(row, 11);
+            event.quantity = intCell(row, 12);
+            event.accepted = boolCell(row, 13);
+            event.canceled = boolCell(row, 14);
+            if (!cell(row, 15).empty()) {
+                event.cooldownUntil = timeFromEpochSeconds(intCell(row, 15));
+            }
+            event.createdAt = timeFromEpochSeconds(intCell(row, 16));
+            events.push_back(std::move(event));
+        }
+
+        PQclear(query);
+#endif
+        return events;
     }
 
     ~PersistenceStore() {
@@ -1886,6 +2001,17 @@ public:
         ParticipantTrack track,
         const std::string& eventType,
         std::optional<TimePoint> cooldownUntil = std::nullopt) {
+        PersistedEvent event;
+        event.eventType = eventType == "leave" ? "session_leave" : "session_join";
+        event.sessionId = sessionId;
+        event.roomId = roomId;
+        event.roomMode = mode;
+        event.traderId = traderId;
+        event.track = track;
+        event.cooldownUntil = cooldownUntil;
+        event.createdAt = Clock::now();
+        appendPersistedEvent(event);
+
         execParams(
             "INSERT INTO orderbook_session_events "
             "(session_id, room_id, mode, trader_id, track, event_type, cooldown_until_epoch) "
@@ -1903,11 +2029,29 @@ public:
 
     void recordOrder(
         const std::string& sessionId,
+        const std::string& roomId,
+        RoomMode roomMode,
         TraderId traderId,
         Side side,
         const std::string& mode,
         const ParsedOrder& order,
         const SubmitResult& result) {
+        PersistedEvent event;
+        event.eventType = "order_submit";
+        event.sessionId = sessionId;
+        event.roomId = roomId;
+        event.roomMode = roomMode;
+        event.traderId = traderId;
+        event.symbol = order.symbol;
+        event.side = side;
+        event.orderMode = mode;
+        event.orderId = order.orderId;
+        event.price = order.price;
+        event.quantity = order.quantity;
+        event.accepted = result.accepted;
+        event.createdAt = Clock::now();
+        appendPersistedEvent(event);
+
         execParams(
             "INSERT INTO orderbook_orders "
             "(session_id, trader_id, order_id, symbol, side, mode, price, quantity, accepted, "
@@ -1932,10 +2076,25 @@ public:
 
     void recordCancel(
         const std::string& sessionId,
+        const std::string& roomId,
+        RoomMode roomMode,
         TraderId traderId,
         const std::string& symbol,
         OrderId orderId,
         bool canceled) {
+        PersistedEvent event;
+        event.eventType = "order_cancel";
+        event.sessionId = sessionId;
+        event.roomId = roomId;
+        event.roomMode = roomMode;
+        event.traderId = traderId;
+        event.symbol = symbol;
+        event.orderMode = "cancel";
+        event.orderId = orderId;
+        event.canceled = canceled;
+        event.createdAt = Clock::now();
+        appendPersistedEvent(event);
+
         execParams(
             "INSERT INTO orderbook_cancels "
             "(session_id, trader_id, symbol, order_id, canceled) "
@@ -1993,6 +2152,50 @@ public:
     }
 
 private:
+    std::int64_t appendPersistedEvent(const PersistedEvent& event) const {
+        const std::int64_t eventId = execParamsReturningInt64(
+            "INSERT INTO orderbook_events "
+            "(event_type, session_id, room_id, room_mode, trader_id, track, symbol, side, order_mode, "
+            "order_id, price, quantity, accepted, canceled, cooldown_until_epoch, created_at_epoch) "
+            "VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16) "
+            "RETURNING id",
+            {
+                event.eventType,
+                event.sessionId,
+                event.roomId,
+                roomModeToString(event.roomMode),
+                std::to_string(event.traderId),
+                participantTrackToString(event.track),
+                event.symbol,
+                sideToString(event.side),
+                event.orderMode,
+                event.orderId == 0 ? "" : std::to_string(event.orderId),
+                event.price == 0 ? "" : std::to_string(event.price),
+                event.quantity == 0 ? "" : std::to_string(event.quantity),
+                event.accepted ? "true" : "false",
+                event.canceled ? "true" : "false",
+                event.cooldownUntil ? std::to_string(epochSeconds(*event.cooldownUntil)) : "",
+                std::to_string(epochSeconds(event.createdAt)),
+            });
+
+        maybeRecordCheckpoint(eventId);
+        return eventId;
+    }
+
+    void maybeRecordCheckpoint(std::int64_t eventId) const {
+        if (eventId <= 0 || checkpointEveryEvents <= 0 || eventId % checkpointEveryEvents != 0) {
+            return;
+        }
+
+        execParams(
+            "INSERT INTO orderbook_checkpoints (event_id, kind, note) VALUES ($1, $2, $3)",
+            {
+                std::to_string(eventId),
+                "event-watermark",
+                "Replayable event-log checkpoint. Full state snapshot restore is the next durability layer.",
+            });
+    }
+
     void ensureSchema() {
 #ifdef ORDERBOOK_WITH_POSTGRES
         exec(
@@ -2071,6 +2274,35 @@ private:
             "rating_before INTEGER NOT NULL,"
             "rating_after INTEGER NOT NULL,"
             "created_at TIMESTAMPTZ NOT NULL DEFAULT now()"
+            ");"
+            "CREATE TABLE IF NOT EXISTS orderbook_events ("
+            "id BIGSERIAL PRIMARY KEY,"
+            "event_type TEXT NOT NULL,"
+            "session_id TEXT NOT NULL,"
+            "room_id TEXT NOT NULL,"
+            "room_mode TEXT NOT NULL,"
+            "trader_id BIGINT NOT NULL,"
+            "track TEXT,"
+            "symbol TEXT,"
+            "side TEXT,"
+            "order_mode TEXT,"
+            "order_id BIGINT,"
+            "price BIGINT,"
+            "quantity BIGINT,"
+            "accepted BOOLEAN NOT NULL DEFAULT false,"
+            "canceled BOOLEAN NOT NULL DEFAULT false,"
+            "cooldown_until_epoch BIGINT,"
+            "created_at_epoch BIGINT NOT NULL,"
+            "created_at TIMESTAMPTZ NOT NULL DEFAULT now()"
+            ");"
+            "CREATE INDEX IF NOT EXISTS orderbook_events_session_idx "
+            "ON orderbook_events(session_id, id);"
+            "CREATE TABLE IF NOT EXISTS orderbook_checkpoints ("
+            "id BIGSERIAL PRIMARY KEY,"
+            "event_id BIGINT NOT NULL,"
+            "kind TEXT NOT NULL,"
+            "note TEXT NOT NULL,"
+            "created_at TIMESTAMPTZ NOT NULL DEFAULT now()"
             ");");
 #endif
     }
@@ -2124,6 +2356,45 @@ private:
         (void)params;
 #endif
     }
+
+    std::int64_t execParamsReturningInt64(const std::string& sql, const std::vector<std::string>& params) const {
+#ifdef ORDERBOOK_WITH_POSTGRES
+        if (connection == nullptr) {
+            return 0;
+        }
+
+        std::vector<const char*> values;
+        values.reserve(params.size());
+        for (const std::string& param : params) {
+            values.push_back(param.empty() ? nullptr : param.c_str());
+        }
+
+        PGresult* result = PQexecParams(
+            connection,
+            sql.c_str(),
+            static_cast<int>(values.size()),
+            nullptr,
+            values.data(),
+            nullptr,
+            nullptr,
+            0);
+        if (PQresultStatus(result) != PGRES_TUPLES_OK || PQntuples(result) != 1) {
+            std::cerr << "PostgreSQL write failed: " << PQerrorMessage(connection) << "\n";
+            PQclear(result);
+            return 0;
+        }
+
+        const std::int64_t value = std::stoll(PQgetvalue(result, 0, 0));
+        PQclear(result);
+        return value;
+#else
+        (void)sql;
+        (void)params;
+        return 0;
+#endif
+    }
+
+    int checkpointEveryEvents = 100;
 
 #ifdef ORDERBOOK_WITH_POSTGRES
     PGconn* connection = nullptr;
@@ -2389,6 +2660,8 @@ HttpResponse orderResultResponse(
     AccountStore& accounts,
     PersistenceStore& persistence,
     const std::string& sessionId,
+    const std::string& roomId,
+    RoomMode roomMode,
     const std::string& symbol,
     const ParsedOrder& order,
     TraderId traderId,
@@ -2396,7 +2669,7 @@ HttpResponse orderResultResponse(
     const std::string& mode,
     const SubmitResult& result) {
     accounts.recordTrades(symbol, result);
-    persistence.recordOrder(sessionId, traderId, side, mode, order, result);
+    persistence.recordOrder(sessionId, roomId, roomMode, traderId, side, mode, order, result);
     persistence.recordTrades(sessionId, symbol, result);
     return jsonResponse(200, serializeSubmitResult(result));
 }
@@ -2464,6 +2737,8 @@ HttpResponse handlePostOrder(
                 accounts,
                 persistence,
                 sessionId,
+                room.id,
+                room.mode,
                 order.symbol,
                 order,
                 traderId,
@@ -2480,6 +2755,8 @@ HttpResponse handlePostOrder(
                 accounts,
                 persistence,
                 sessionId,
+                room.id,
+                room.mode,
                 order.symbol,
                 order,
                 traderId,
@@ -2496,6 +2773,8 @@ HttpResponse handlePostOrder(
                 accounts,
                 persistence,
                 sessionId,
+                room.id,
+                room.mode,
                 order.symbol,
                 order,
                 traderId,
@@ -2512,6 +2791,8 @@ HttpResponse handlePostOrder(
                 accounts,
                 persistence,
                 sessionId,
+                room.id,
+                room.mode,
                 order.symbol,
                 order,
                 traderId,
@@ -2528,6 +2809,8 @@ HttpResponse handlePostOrder(
                 accounts,
                 persistence,
                 sessionId,
+                room.id,
+                room.mode,
                 order.symbol,
                 order,
                 traderId,
@@ -2544,6 +2827,8 @@ HttpResponse handlePostOrder(
                 accounts,
                 persistence,
                 sessionId,
+                room.id,
+                room.mode,
                 order.symbol,
                 order,
                 traderId,
@@ -2560,6 +2845,8 @@ HttpResponse handlePostOrder(
                 accounts,
                 persistence,
                 sessionId,
+                room.id,
+                room.mode,
                 order.symbol,
                 order,
                 traderId,
@@ -2576,6 +2863,8 @@ HttpResponse handlePostOrder(
                 accounts,
                 persistence,
                 sessionId,
+                room.id,
+                room.mode,
                 order.symbol,
                 order,
                 traderId,
@@ -2591,6 +2880,8 @@ HttpResponse handlePostOrder(
                 accounts,
                 persistence,
                 sessionId,
+                room.id,
+                room.mode,
                 order.symbol,
                 order,
                 traderId,
@@ -2606,6 +2897,8 @@ HttpResponse handlePostOrder(
                 accounts,
                 persistence,
                 sessionId,
+                room.id,
+                room.mode,
                 order.symbol,
                 order,
                 traderId,
@@ -2623,7 +2916,7 @@ HttpResponse handlePostOrder(
             }
 
             const bool canceled = exchange.cancelForTrader(*symbol, traderId, *orderId);
-            persistence.recordCancel(sessionId, traderId, *symbol, *orderId, canceled);
+            persistence.recordCancel(sessionId, room.id, room.mode, traderId, *symbol, *orderId, canceled);
             return jsonResponse(200, std::string("{\"canceled\":") + (canceled ? "true" : "false") + "}");
         }
     } catch (const AuthError& ex) {
@@ -3424,6 +3717,101 @@ bool RoomStore::leaveCompetitiveLobby(const std::string& lobbyId, TraderId trade
     return true;
 }
 
+SubmitResult submitPersistedOrder(GameRoom& room, const PersistedEvent& event) {
+    room.orderIds.setNextAtLeast(event.orderId + 1);
+
+    if (event.orderMode == "market") {
+        return event.side == Side::Buy
+            ? room.exchange.marketBuy(event.symbol, event.traderId, event.orderId, event.quantity)
+            : room.exchange.marketSell(event.symbol, event.traderId, event.orderId, event.quantity);
+    }
+
+    if (event.orderMode == "ioc") {
+        return event.side == Side::Buy
+            ? room.exchange.iocBuy(event.symbol, event.traderId, event.orderId, event.price, event.quantity)
+            : room.exchange.iocSell(event.symbol, event.traderId, event.orderId, event.price, event.quantity);
+    }
+
+    if (event.orderMode == "fok") {
+        return event.side == Side::Buy
+            ? room.exchange.fokBuy(event.symbol, event.traderId, event.orderId, event.price, event.quantity)
+            : room.exchange.fokSell(event.symbol, event.traderId, event.orderId, event.price, event.quantity);
+    }
+
+    if (event.orderMode == "replace") {
+        return event.side == Side::Buy
+            ? room.exchange.replaceBuy(event.symbol, event.traderId, event.orderId, event.price, event.quantity)
+            : room.exchange.replaceSell(event.symbol, event.traderId, event.orderId, event.price, event.quantity);
+    }
+
+    return event.side == Side::Buy
+        ? room.exchange.buy(event.symbol, event.traderId, event.orderId, event.price, event.quantity)
+        : room.exchange.sell(event.symbol, event.traderId, event.orderId, event.price, event.quantity);
+}
+
+RestoreStats restoreFromEvents(RoomStore& rooms, const std::vector<PersistedEvent>& events) {
+    RestoreStats stats;
+
+    for (const PersistedEvent& event : events) {
+        ++stats.events;
+
+        if (event.eventType == "session_join") {
+            if (rooms.restoreSessionJoin(event)) {
+                ++stats.sessions;
+            } else {
+                ++stats.skipped;
+            }
+            continue;
+        }
+
+        if (event.eventType == "session_leave") {
+            if (rooms.restoreSessionLeave(event)) {
+                ++stats.sessions;
+            } else {
+                ++stats.skipped;
+            }
+            continue;
+        }
+
+        GameRoom* game = rooms.gameForPersistedSession(event);
+        if (game == nullptr) {
+            ++stats.skipped;
+            continue;
+        }
+
+        if (event.eventType == "order_submit") {
+            const SubmitResult result = submitPersistedOrder(*game, event);
+            if (result.accepted != event.accepted) {
+                std::cerr << "Replay warning: order " << event.orderId
+                          << " accepted=" << result.accepted
+                          << " but persisted accepted=" << event.accepted << "\n";
+            }
+
+            game->accounts.recordTrades(event.symbol, result);
+            ++stats.orders;
+            continue;
+        }
+
+        if (event.eventType == "order_cancel") {
+            game->orderIds.setNextAtLeast(event.orderId + 1);
+            if (event.canceled) {
+                const bool replayCanceled = game->exchange.cancelForTrader(event.symbol, event.traderId, event.orderId);
+                if (!replayCanceled) {
+                    std::cerr << "Replay warning: cancel for order " << event.orderId
+                              << " did not find a resting order\n";
+                }
+            }
+
+            ++stats.cancels;
+            continue;
+        }
+
+        ++stats.skipped;
+    }
+
+    return stats;
+}
+
 bool RoomStore::hasActiveSession(TraderId traderId, const std::string& sessionId) const {
     std::lock_guard<std::mutex> lock(sessionMutex);
     const auto active = activeByTrader.find(traderId);
@@ -3472,6 +3860,86 @@ bool RoomStore::storeLeaderboardRatings(const CompetitiveLobby& lobby) {
     return true;
 }
 
+bool RoomStore::restoreSessionJoin(const PersistedEvent& event) {
+    if (event.roomMode == RoomMode::Single) {
+        std::lock_guard<std::mutex> lock(sessionMutex);
+        SinglePlayerSession* session = ensureSingleSessionLocked(event.roomId, event.traderId, event.createdAt);
+        if (session == nullptr) {
+            return false;
+        }
+
+        session->active = true;
+        session->joinedAt = event.createdAt;
+        activeByTrader[event.traderId] = {event.sessionId, event.roomId, false};
+        cooldownUntilByTrader.erase(event.traderId);
+        return true;
+    }
+
+    CompetitiveLobby* lobby = findLobby(event.sessionId);
+    if (lobby == nullptr) {
+        return false;
+    }
+
+    const LobbyJoinResult joinResult = lobby->joinAt(event.traderId, event.track, event.createdAt);
+    if (joinResult != LobbyJoinResult::Joined && joinResult != LobbyJoinResult::AlreadyJoined) {
+        return false;
+    }
+
+    std::lock_guard<std::mutex> lock(sessionMutex);
+    activeByTrader[event.traderId] = {event.sessionId, event.roomId, true};
+    cooldownUntilByTrader.erase(event.traderId);
+    return true;
+}
+
+bool RoomStore::restoreSessionLeave(const PersistedEvent& event) {
+    const TimePoint cooldownUntil = event.cooldownUntil.value_or(
+        event.createdAt + std::chrono::seconds(gameConfig.rejoinCooldownSeconds));
+
+    if (event.roomMode == RoomMode::Single) {
+        std::lock_guard<std::mutex> lock(sessionMutex);
+        SinglePlayerSession* session = ensureSingleSessionLocked(event.roomId, event.traderId, event.createdAt);
+        if (session == nullptr) {
+            return false;
+        }
+
+        cancelTraderOrders(session->game->exchange, event.traderId);
+        session->active = false;
+        if (activeByTrader.contains(event.traderId) && activeByTrader[event.traderId].id == event.sessionId) {
+            markLeftLocked(event.traderId, cooldownUntil);
+        } else {
+            cooldownUntilByTrader[event.traderId] = cooldownUntil;
+        }
+        return true;
+    }
+
+    CompetitiveLobby* lobby = findLobby(event.sessionId);
+    if (lobby == nullptr) {
+        return false;
+    }
+
+    lobby->leaveAt(event.traderId, event.createdAt);
+    cancelTraderOrders(lobby->game->exchange, event.traderId);
+
+    std::lock_guard<std::mutex> lock(sessionMutex);
+    if (activeByTrader.contains(event.traderId) && activeByTrader[event.traderId].id == event.sessionId) {
+        markLeftLocked(event.traderId, cooldownUntil);
+    } else {
+        cooldownUntilByTrader[event.traderId] = cooldownUntil;
+    }
+    return true;
+}
+
+GameRoom* RoomStore::gameForPersistedSession(const PersistedEvent& event) {
+    if (event.roomMode == RoomMode::Competitive) {
+        CompetitiveLobby* lobby = findLobby(event.sessionId);
+        return lobby == nullptr ? nullptr : lobby->game.get();
+    }
+
+    std::lock_guard<std::mutex> lock(sessionMutex);
+    SinglePlayerSession* session = ensureSingleSessionLocked(event.roomId, event.traderId, event.createdAt);
+    return session == nullptr ? nullptr : session->game.get();
+}
+
 std::unique_ptr<GameRoom> RoomStore::cloneSingleRoom(const GameRoom& room) const {
     auto clone = std::make_unique<GameRoom>();
     clone->id = room.id;
@@ -3487,6 +3955,31 @@ std::unique_ptr<GameRoom> RoomStore::cloneSingleRoom(const GameRoom& room) const
     clone->assets = room.assets;
     seedRoom(*clone);
     return clone;
+}
+
+SinglePlayerSession* RoomStore::ensureSingleSessionLocked(
+    const std::string& roomId,
+    TraderId traderId,
+    TimePoint joinedAt) {
+    const GameRoom* room = find(roomId);
+    if (room == nullptr || room->mode != RoomMode::Single) {
+        return nullptr;
+    }
+
+    auto& sessions = singleSessionsByRoom[roomId];
+    auto found = sessions.find(traderId);
+    if (found == sessions.end()) {
+        auto session = std::make_unique<SinglePlayerSession>();
+        session->id = roomId + "-" + std::to_string(traderId);
+        session->roomId = roomId;
+        session->traderId = traderId;
+        session->game = cloneSingleRoom(*room);
+        session->joinedAt = joinedAt;
+        session->active = false;
+        found = sessions.emplace(traderId, std::move(session)).first;
+    }
+
+    return found->second.get();
 }
 
 LobbyJoinOutcome RoomStore::canJoinSessionLocked(TraderId traderId, const std::string& sessionId) const {
@@ -3513,8 +4006,12 @@ void RoomStore::markJoinedLocked(TraderId traderId, const ActiveSession& session
 }
 
 void RoomStore::markLeftLocked(TraderId traderId) {
+    markLeftLocked(traderId, Clock::now() + std::chrono::seconds(gameConfig.rejoinCooldownSeconds));
+}
+
+void RoomStore::markLeftLocked(TraderId traderId, TimePoint cooldownUntil) {
     activeByTrader.erase(traderId);
-    cooldownUntilByTrader[traderId] = Clock::now() + std::chrono::seconds(gameConfig.rejoinCooldownSeconds);
+    cooldownUntilByTrader[traderId] = cooldownUntil;
 }
 
 int parsePort(const char* value, int fallback) {
@@ -3547,12 +4044,20 @@ int main(int argc, char** argv) {
         RoomStore rooms(config);
         rooms.ratings(ParticipantTrack::Manual) = persistence.loadRatings(ParticipantTrack::Manual);
         rooms.ratings(ParticipantTrack::Bot) = persistence.loadRatings(ParticipantTrack::Bot);
+        const RestoreStats restoreStats = restoreFromEvents(rooms, persistence.loadReplayEvents());
 
         std::cout << "Orderbook API server listening on 0.0.0.0:" << port << "\n";
         std::cout << "Starting cash: " << config.startingCash
                   << ", competitive start delay: " << config.startDelaySeconds
                   << "s, game duration: " << config.gameDurationSeconds
                   << "s, rejoin cooldown: " << config.rejoinCooldownSeconds << "s\n";
+        if (persistence.enabled()) {
+            std::cout << "Replayed " << restoreStats.events << " persisted events ("
+                      << restoreStats.sessions << " session, "
+                      << restoreStats.orders << " order, "
+                      << restoreStats.cancels << " cancel, "
+                      << restoreStats.skipped << " skipped).\n";
+        }
         std::cout << "Press Ctrl+C to stop.\n";
 
         while (true) {
